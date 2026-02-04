@@ -1,6 +1,6 @@
 # Biosecurity × AI Risk Explorer
 
-Interactive tool for exploring when model safeguards matter for AI biosecurity.
+Interactive tool for exploring when AI model safeguards matter for biosecurity based on compute cost curves, model sizes, and safeguard resistance to adversarial fine-tuning.
 
 ## Live Demo
 
