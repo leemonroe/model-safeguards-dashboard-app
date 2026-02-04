@@ -291,7 +291,7 @@ function ThreatHeatmap({ data, years, profiles, width = 400 }) {
 }
 
 // ── Main ─────────────────────────────────────────────────────────
-export default function BiosecurityExplorer() {
+export default function ModelSafeguardsDashboard() {
   // Model & compute params
   const [modelSize, setModelSize] = useState(40);
   const [trainingCostBase, setTrainingCostBase] = useState(20);
