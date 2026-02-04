@@ -1,0 +1,1293 @@
+import { useState, useMemo } from "react";
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
+  ResponsiveContainer, BarChart, Bar, Cell, ReferenceLine, Area,
+  AreaChart, ComposedChart
+} from "recharts";
+
+// ── Utility ─────────────────────────────────────────────────────────────────
+
+const fmt = (n) => {
+  if (n >= 1e12) return `$${(n / 1e12).toFixed(1)}T`;
+  if (n >= 1e9) return `$${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
+  if (n >= 1) return `$${n.toFixed(0)}`;
+  if (n >= 0.01) return `$${n.toFixed(2)}`;
+  return `<$0.01`;
+};
+
+const fmtX = (n) => {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M×`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K×`;
+  if (n >= 100) return `${n.toFixed(0)}×`;
+  if (n >= 10) return `${n.toFixed(1)}×`;
+  return `${n.toFixed(2)}×`;
+};
+
+const fmtParams = (n) => {
+  if (n >= 1e12) return `${(n / 1e12).toFixed(1)}T`;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(0)}M`;
+  return `${n.toFixed(0)}`;
+};
+
+const logScale = (min, max, f) => Math.pow(10, Math.log10(min) + f * (Math.log10(max) - Math.log10(min)));
+const logFrac = (min, max, v) => (Math.log10(Math.max(v, min)) - Math.log10(min)) / (Math.log10(max) - Math.log10(min));
+
+// ── Model Core ──────────────────────────────────────────────────────────────
+
+// Derive internal parameters from user-facing ones
+function deriveInternal(p) {
+  // Hardware: user provides rate (×/yr) and years-to-plateau
+  // We model as asymptotic: hw_factor(t) = 1 + (headroom-1) * (1 - e^(-t/tau))
+  // tau = yearsToPlateauHw / 3 (so ~95% captured by plateau year)
+  // headroom = hwRate ^ yearsToPlateauHw (total improvement if rate held constant)
+  const tau = p.yearsToPlateauHw / 3;
+  const headroom = Math.pow(p.hwRate, p.yearsToPlateauHw);
+
+  // TR alpha: user provides "10× larger model is X× harder to break"
+  // R(N) = base * (N/1B)^alpha => R(10N)/R(N) = 10^alpha = trScaling10x
+  // => alpha = log10(trScaling10x)
+  const alpha = Math.log10(p.trScaling10x);
+
+  return { tau, headroom, alpha };
+}
+
+function computeModel(p) {
+  const { tau, headroom, alpha } = deriveInternal(p);
+  const data = [];
+  const YEARS = 25;
+
+  for (let t = 0; t <= YEARS; t++) {
+    // ── Hardware: asymptotic ──
+    const hwFactor = t === 0 ? 1 : 1 + (headroom - 1) * (1 - Math.exp(-t / tau));
+
+    // ── Algorithmic: decelerating exponential (floor = 1.0) ──
+    let cumAlgo = 1;
+    for (let i = 1; i <= t; i++) {
+      const decay = Math.pow(0.5, i / p.algoHalflife);
+      const rate = 1 + (p.algoRate - 1) * decay;
+      cumAlgo *= rate;
+    }
+
+    // ── Combined training cost ──
+    const cumTrainReduction = hwFactor * cumAlgo;
+    const costTrain = p.costTrainBase / cumTrainReduction;
+    const costTrainHwOnly = p.costTrainBase / hwFactor;
+
+    // ── Fine-tuning: benefits from same hw + algo (simplified) ──
+    const cumFtReduction = hwFactor * cumAlgo;
+    const costFtRaw = p.costFtBase / cumFtReduction;
+
+    // ── Attack improvement: decelerates on same timeline as algo ──
+    let cumAttack = 1;
+    for (let i = 1; i <= t; i++) {
+      const decay = Math.pow(0.5, i / p.algoHalflife);
+      const rate = 1 + (p.attackRate - 1) * decay;
+      cumAttack *= rate;
+    }
+
+    // ── Tamper resistance ──
+    const trMultiplier = p.trBase * Math.pow(p.nThreshold / 1e9, alpha);
+
+    // ── Cost to remove safeguard ──
+    const costRemove = costFtRaw * trMultiplier / cumAttack;
+
+    // ── Derived ──
+    const costAttack = Math.min(costRemove, costTrain);
+    const maxUsefulTR = costTrain / costFtRaw * cumAttack;
+
+    // Effective annual rates for decomposition
+    let effHwRate = 1;
+    if (t > 0) {
+      const hwPrev = 1 + (headroom - 1) * (1 - Math.exp(-(t - 1) / tau));
+      effHwRate = hwFactor / hwPrev;
+    }
+    const algoDecay = Math.pow(0.5, Math.max(t, 1) / p.algoHalflife);
+    const effAlgoRate = 1 + (p.algoRate - 1) * algoDecay;
+
+    data.push({
+      year: 2026 + t, t,
+      costTrain, costTrainHwOnly, costRemove, costFtRaw, costAttack,
+      hwFactor, cumAlgo, cumTrainReduction,
+      effHwRate, effAlgoRate, effCombined: effHwRate * effAlgoRate,
+      trMultiplier, maxUsefulTR,
+    });
+  }
+  return data;
+}
+
+function findRelevanceYear(data, budget) {
+  for (let i = 0; i < data.length; i++) {
+    if (data[i].costAttack <= budget) return i;
+  }
+  return data.length;
+}
+
+// ── Monte Carlo Global Sensitivity ──────────────────────────────────────────
+
+const PARAM_RANGES = [
+  { key: "costTrainBase", label: "Training cost today", lo: 1e7, hi: 5e10, log: true,
+    src: "GPT-4 ~$100M; frontier 2025 ~$500M-$2B; smaller capable models much less" },
+  { key: "costFtBase", label: "Base attack cost today", lo: 500, hi: 5e5, log: true,
+    src: "LoRA fine-tune ~$500-$5K; full fine-tune at scale ~$50K-$500K. Includes data prep." },
+  { key: "hwRate", label: "Hardware improvement rate", lo: 1.05, hi: 1.8, log: false,
+    src: "Epoch: GPU FLOP/$ doubles every ~2.5yr (1.32×). With specialization: up to ~1.8×. Near-asymptote: 1.05×." },
+  { key: "yearsToPlateauHw", label: "Years until hardware plateaus", lo: 3, hi: 20, log: false,
+    src: "Could be near-asymptote already (3yr) or extended by 3D stacking/new materials (20yr)." },
+  { key: "algoRate", label: "Algorithmic efficiency rate", lo: 1.0, hi: 5.0, log: false,
+    src: "Could be zero (1.0×) if current gains are pure catch-up. Controlled estimates: ~3×/yr. Catch-up: up to 60×/yr." },
+  { key: "algoHalflife", label: "Years of fast algo progress", lo: 3, hi: 20, log: false,
+    src: "Catch-up from transformers may stall fast (3yr). AI-driven R&D could sustain 15-20yr." },
+  { key: "attackRate", label: "Attack method improvement", lo: 1.0, hi: 3.5, log: false,
+    src: "Could plateau entirely (1.0×). LoRA/QLoRA rapid gains 2023-2025. Automated red-teaming may accelerate." },
+  { key: "trBase", label: "Tamper resistance multiplier", lo: 5, hi: 10000, log: true,
+    src: "Deep Ignorance: survived 10K steps. TAR/Circuit Breakers: modest multipliers. Nascent field." },
+  { key: "trScaling10x", label: "TR scaling (10× larger model)", lo: 1.0, hi: 5.0, log: false,
+    src: "Almost no empirical data. Most uncertain parameter in the entire model." },
+  { key: "nThreshold", label: "Capability threshold", lo: 1e9, hi: 5e11, log: true,
+    src: "Capability-dependent. Some risks at 7-70B; others may require 100B+." },
+];
+
+function sampleUniform(lo, hi, log) {
+  if (log) return Math.exp(Math.log(lo) + Math.random() * (Math.log(hi) - Math.log(lo)));
+  return lo + Math.random() * (hi - lo);
+}
+
+function sampleParams(overrides) {
+  const s = {};
+  PARAM_RANGES.forEach(r => {
+    const o = overrides?.[r.key];
+    s[r.key] = o ? sampleUniform(o[0], o[1], r.log) : sampleUniform(r.lo, r.hi, r.log);
+  });
+  return s;
+}
+
+function fastRelevanceYear(p, budget) {
+  const tau = p.yearsToPlateauHw / 3;
+  const headroom = Math.pow(p.hwRate, p.yearsToPlateauHw);
+  const alpha = Math.log10(Math.max(p.trScaling10x, 1.001));
+  let cumAlgo = 1, cumAttack = 1;
+  for (let t = 0; t <= 25; t++) {
+    const hwF = t === 0 ? 1 : 1 + (headroom - 1) * (1 - Math.exp(-t / tau));
+    if (t > 0) {
+      const ad = Math.pow(0.5, t / p.algoHalflife);
+      cumAlgo *= 1 + (p.algoRate - 1) * ad;
+      cumAttack *= 1 + (p.attackRate - 1) * ad;
+    }
+    const costTrain = p.costTrainBase / (hwF * cumAlgo);
+    const costFtRaw = p.costFtBase / (hwF * cumAlgo);
+    const tr = p.trBase * Math.pow(p.nThreshold / 1e9, alpha);
+    const costRemove = costFtRaw * tr / cumAttack;
+    if (Math.min(costRemove, costTrain) <= budget) return t;
+  }
+  return 26;
+}
+
+function runMonteCarlo(budget, n, overrides) {
+  const results = [];
+  for (let i = 0; i < n; i++) {
+    const s = sampleParams(overrides);
+    results.push({ p: s, yr: fastRelevanceYear(s, budget) });
+  }
+  return results;
+}
+
+function analyzeResults(results) {
+  const yrs = results.map(r => r.yr).sort((a, b) => a - b);
+  const n = yrs.length;
+  const mean = yrs.reduce((a, b) => a + b, 0) / n;
+  const totalVar = yrs.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
+
+  const pctl = (f) => yrs[Math.min(Math.floor(f * n), n - 1)];
+  const percentiles = { p5: pctl(0.05), p10: pctl(0.1), p25: pctl(0.25), p50: pctl(0.5), p75: pctl(0.75), p90: pctl(0.9), p95: pctl(0.95) };
+
+  // Histogram
+  const hist = [];
+  for (let y = 0; y <= 26; y++) {
+    hist.push({ year: y >= 26 ? ">25" : `${y}`, count: yrs.filter(v => v === y).length, pct: +(yrs.filter(v => v === y).length / n * 100).toFixed(1) });
+  }
+
+  // Variance decomposition (split-halves approximation of first-order Sobol)
+  const decomp = PARAM_RANGES.map(r => {
+    const sorted = [...results].sort((a, b) => a.p[r.key] - b.p[r.key]);
+    const half = Math.floor(n / 2);
+    const loMean = sorted.slice(0, half).reduce((a, s) => a + s.yr, 0) / half;
+    const hiMean = sorted.slice(half).reduce((a, s) => a + s.yr, 0) / (n - half);
+    const varCE = ((loMean - mean) ** 2 + (hiMean - mean) ** 2) / 2;
+    return {
+      ...r, importance: totalVar > 0 ? varCE / totalVar : 0,
+      loMean: +loMean.toFixed(1), hiMean: +hiMean.toFixed(1),
+      importancePct: totalVar > 0 ? +(varCE / totalVar * 100).toFixed(1) : 0,
+    };
+  }).sort((a, b) => b.importance - a.importance);
+
+  return { mean: +mean.toFixed(1), percentiles, hist, decomp, totalVar, n };
+}
+
+// ── Theme ───────────────────────────────────────────────────────────────────
+
+const C = {
+  bg: "#08090d", bgSide: "#0c0e14", bgCard: "#10131b", bgInner: "#0a0c12",
+  border: "#1a1e2e", borderLt: "#252a3a",
+  text: "#d8dce8", muted: "#8892a8", dim: "#5a6278",
+  train: "#e87f3a", remove: "#3abfe8", attack: "#b07ae8",
+  green: "#3ae88a", red: "#e85a5a", yellow: "#e8cf3a",
+  hw: "#e87f3a", algo: "#3abfe8", combined: "#b07ae8",
+};
+
+const ACTORS = [
+  { label: "Individual ($10K)", budget: 1e4 },
+  { label: "Small Org ($1M)", budget: 1e6 },
+  { label: "Well-funded Org ($100M)", budget: 1e8 },
+  { label: "Nation State ($10B)", budget: 1e10 },
+  { label: "Custom", budget: null },
+];
+
+// ── Components ──────────────────────────────────────────────────────────────
+
+function Slider({ label, value, onChange, min, max, step, format, log, tip, color }) {
+  const [showTip, setShowTip] = useState(false);
+  const display = format ? format(value) : value;
+  const sv = log ? logFrac(min, max, value) * 1000 : ((value - min) / (max - min)) * 1000;
+  const handle = (e) => {
+    const r = Number(e.target.value) / 1000;
+    if (log) onChange(logScale(min, max, r));
+    else {
+      const v = min + r * (max - min);
+      onChange(step ? Math.round(v / step) * step : v);
+    }
+  };
+  const ac = color || C.dim;
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+        <span style={{ color: C.muted, fontSize: 11, fontFamily: "var(--f)", position: "relative" }}>
+          {label}
+          {tip && (
+            <span onMouseEnter={() => setShowTip(true)} onMouseLeave={() => setShowTip(false)}
+              onClick={() => setShowTip(s => !s)}
+              style={{ marginLeft: 4, cursor: "help", color: C.dim, fontSize: 10, userSelect: "none" }}>
+              ⓘ
+              {showTip && (
+                <span style={{
+                  position: "absolute", left: 0, top: "calc(100% + 6px)", zIndex: 100,
+                  background: "#1a2030", border: `1px solid ${C.borderLt}`, borderRadius: 5,
+                  padding: "8px 10px", fontSize: 10, lineHeight: 1.5, color: C.muted,
+                  width: 230, boxShadow: "0 6px 24px rgba(0,0,0,0.5)", fontWeight: 400,
+                  pointerEvents: "none",
+                }}>{tip}</span>
+              )}
+            </span>
+          )}
+        </span>
+        <span style={{
+          color: C.text, fontSize: 12, fontFamily: "var(--f)", fontWeight: 600,
+          background: ac + "18", padding: "1px 6px", borderRadius: 3,
+        }}>{display}</span>
+      </div>
+      <input type="range" min={0} max={1000} value={sv} onChange={handle} style={{
+        width: "100%", height: 3, appearance: "none",
+        background: `linear-gradient(to right, ${ac}44, ${ac})`,
+        borderRadius: 2, outline: "none", cursor: "pointer", accentColor: ac,
+      }} />
+    </div>
+  );
+}
+
+function GroupLabel({ children, color }) {
+  return (
+    <div style={{
+      fontSize: 10, color: color || C.dim, marginBottom: 6, marginTop: 18,
+      fontWeight: 700, fontFamily: "var(--f)", textTransform: "uppercase",
+      letterSpacing: "0.1em", display: "flex", alignItems: "center", gap: 6,
+    }}>
+      <span style={{ width: 8, height: 2, background: color, display: "inline-block", borderRadius: 1 }} />
+      {children}
+    </div>
+  );
+}
+
+function Section({ children, sub, mt }) {
+  return (
+    <div style={{ marginBottom: 14, marginTop: mt ?? 28 }}>
+      <h2 style={{
+        fontSize: 14, fontWeight: 600, color: C.text, fontFamily: "var(--f)",
+        letterSpacing: "0.02em", margin: 0, paddingBottom: 6,
+        borderBottom: `1px solid ${C.border}`,
+      }}>{children}</h2>
+      {sub && <p style={{ fontSize: 11, color: C.dim, margin: "5px 0 0", fontFamily: "var(--f)", lineHeight: 1.5 }}>{sub}</p>}
+    </div>
+  );
+}
+
+function Tip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  return (
+    <div style={{
+      background: "#161a28ee", border: `1px solid ${C.border}`, borderRadius: 5,
+      padding: "8px 12px", fontFamily: "var(--f)", fontSize: 10,
+      boxShadow: "0 4px 20px rgba(0,0,0,0.4)",
+    }}>
+      <div style={{ color: C.muted, marginBottom: 5, fontSize: 11 }}>{label}</div>
+      {payload.map((p, i) => (
+        <div key={i} style={{ color: p.color, marginBottom: 1 }}>
+          {p.name}: {typeof p.value === 'number' && p.value > 100 ? fmt(p.value) : typeof p.value === 'number' ? p.value.toFixed(2) : p.value}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Chart({ children, h }) {
+  return (
+    <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: "16px 12px 8px" }}>
+      <ResponsiveContainer width="100%" height={h || 380}>{children}</ResponsiveContainer>
+    </div>
+  );
+}
+
+function Metric({ label, value, sub, color }) {
+  return (
+    <div style={{
+      background: C.bgCard, border: `1px solid ${C.border}`,
+      borderLeft: `3px solid ${color || C.dim}`,
+      borderRadius: 6, padding: "14px 16px", flex: 1, minWidth: 150,
+    }}>
+      <div style={{ fontSize: 10, color: C.dim, fontFamily: "var(--f)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>{label}</div>
+      <div style={{ fontSize: 24, fontWeight: 700, color: color || C.text, fontFamily: "var(--f)", lineHeight: 1.1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 10, color: C.muted, marginTop: 4, fontFamily: "var(--f)" }}>{sub}</div>}
+    </div>
+  );
+}
+
+const tickStyle = { fontSize: 10, fontFamily: "var(--f)" };
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+export default function App() {
+  const [tab, setTab] = useState("model");
+
+  // 10 core parameters
+  const [costTrainBase, setCostTrainBase] = useState(5e8);
+  const [costFtBase, setCostFtBase] = useState(5e4);
+  const [hwRate, setHwRate] = useState(1.4);
+  const [yearsToPlateauHw, setYearsToPlateauHw] = useState(10);
+  const [algoRate, setAlgoRate] = useState(2.5);
+  const [algoHalflife, setAlgoHalflife] = useState(8);
+  const [attackRate, setAttackRate] = useState(2.0);
+  const [trBase, setTrBase] = useState(100);
+  const [trScaling10x, setTrScaling10x] = useState(2.0);
+  const [nThreshold, setNThreshold] = useState(7e10);
+
+  // Actor selection
+  const [actorIdx, setActorIdx] = useState(1);
+  const [customBudget, setCustomBudget] = useState(1e6);
+  const budget = ACTORS[actorIdx].budget ?? customBudget;
+
+  const allBudgets = useMemo(() => ACTORS.filter(a => a.budget !== null).map(a => a), []);
+
+  const p = useMemo(() => ({
+    costTrainBase, costFtBase, hwRate, yearsToPlateauHw,
+    algoRate, algoHalflife, attackRate,
+    trBase, trScaling10x, nThreshold,
+  }), [costTrainBase, costFtBase, hwRate, yearsToPlateauHw, algoRate, algoHalflife, attackRate, trBase, trScaling10x, nThreshold]);
+
+  const data = useMemo(() => computeModel(p), [p]);
+  const { headroom } = useMemo(() => deriveInternal(p), [p]);
+  const hwFloor = costTrainBase / headroom;
+
+  // Relevance windows for all preset actors
+  const windows = useMemo(() => allBudgets.map(a => ({
+    ...a,
+    years: findRelevanceYear(data, a.budget),
+  })), [data, allBudgets]);
+
+  const selectedWindow = useMemo(() => findRelevanceYear(data, budget), [data, budget]);
+
+  // Monte Carlo — run on budget change (memoized, seeded fresh each time)
+  const [showAdvRanges, setShowAdvRanges] = useState(false);
+  const [rangeOverrides, setRangeOverrides] = useState({});
+  const [heatMode, setHeatMode] = useState("exact");
+
+  const TR_MULTS = [2, 3, 5, 10, 30, 100, 300, 1000];
+  const HEAT_MAX_YR = 10;
+  const HEAT_N = 3000;
+
+  // TR Investment heatmap MC
+  const trInvestData = useMemo(() => {
+    const rng = (lo, hi, log) => log
+      ? Math.exp(Math.log(lo) + Math.random() * (Math.log(hi) - Math.log(lo)))
+      : lo + Math.random() * (hi - lo);
+    const results = {};
+    TR_MULTS.forEach(x => { results[x] = []; });
+    const baseSamples = [];
+    for (let i = 0; i < HEAT_N; i++) {
+      const s = {};
+      PARAM_RANGES.forEach(r => { s[r.key] = rng(r.lo, r.hi, r.log); });
+      baseSamples.push(s);
+    }
+    for (let i = 0; i < HEAT_N; i++) {
+      const s = baseSamples[i];
+      const baseYr = fastRelevanceYear(s, budget);
+      TR_MULTS.forEach(x => {
+        const s2 = { ...s, trBase: s.trBase * x };
+        const impYr = fastRelevanceYear(s2, budget);
+        results[x].push(Math.max(0, Math.min(impYr - baseYr, HEAT_MAX_YR + 1)));
+      });
+    }
+    return results;
+  }, [budget]);
+
+  const heatRows = useMemo(() => TR_MULTS.map(x => {
+    const gains = trInvestData[x] || [];
+    const n = gains.length || 1;
+    const sorted = [...gains].sort((a, b) => a - b);
+    const row = { tr: `${x}×`, trNum: x };
+    for (let y = 0; y <= HEAT_MAX_YR; y++) {
+      const label = y === HEAT_MAX_YR ? `${y}+` : `${y}`;
+      row[label] = +((gains.filter(g => y === HEAT_MAX_YR ? g >= y : g === y).length / n) * 100).toFixed(1);
+      row[`gte_${y}`] = +((gains.filter(g => g >= y).length / n) * 100).toFixed(1);
+    }
+    row.mean = +(gains.reduce((a, b) => a + b, 0) / n).toFixed(1);
+    row.median = sorted[Math.floor(n / 2)] || 0;
+    return row;
+  }), [trInvestData]);
+  const mcResults = useMemo(() => {
+    const samples = runMonteCarlo(budget, 5000, Object.keys(rangeOverrides).length ? rangeOverrides : undefined);
+    return analyzeResults(samples);
+  }, [budget, rangeOverrides]);
+
+  // Also compute for all preset actors
+  const mcByActor = useMemo(() => {
+    return ACTORS.filter(a => a.budget !== null).map(a => {
+      const samples = runMonteCarlo(a.budget, 2000);
+      const analysis = analyzeResults(samples);
+      return { ...a, ...analysis };
+    });
+  }, [rangeOverrides]);
+
+  const tabs = [
+    { id: "model", label: "Cost Curves" },
+    { id: "decomp", label: "Decomposition" },
+    { id: "relevance", label: "Relevance" },
+    { id: "requiredTR", label: "Required TR" },
+    { id: "trInvest", label: "TR Investment" },
+    { id: "sensitivity", label: "Sensitivity" },
+    { id: "details", label: "Details" },
+  ];
+
+  return (
+    <div style={{ "--f": "'IBM Plex Mono', monospace", background: C.bg, color: C.text, minHeight: "100vh", fontFamily: "var(--f)" }}>
+
+      {/* Header */}
+      <div style={{ borderBottom: `1px solid ${C.border}`, padding: "16px 24px", background: `linear-gradient(180deg, ${C.bgCard} 0%, ${C.bg} 100%)` }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+          <h1 style={{ fontSize: 18, fontWeight: 700, margin: 0, letterSpacing: "-0.02em" }}>
+            Safeguard Relevance Model
+          </h1>
+          <span style={{ fontSize: 10, color: C.dim }}>
+            Open-weight · Hardware asymptote + algorithmic trends · 10 parameters
+          </span>
+        </div>
+        <div style={{ display: "flex", gap: 6, marginTop: 12 }}>
+          {tabs.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{
+              background: tab === t.id ? C.train + "1a" : "transparent",
+              border: `1px solid ${tab === t.id ? C.train + "66" : C.border}`,
+              color: tab === t.id ? C.train : C.muted,
+              borderRadius: 5, padding: "5px 12px", fontSize: 11,
+              fontFamily: "var(--f)", cursor: "pointer",
+            }}>{t.label}</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", minHeight: "calc(100vh - 90px)" }}>
+
+        {/* Sidebar */}
+        <div style={{
+          width: 296, minWidth: 296, borderRight: `1px solid ${C.border}`,
+          padding: "16px 16px", overflowY: "auto", background: C.bgSide,
+          maxHeight: "calc(100vh - 90px)",
+        }}>
+          <GroupLabel color={C.train}>Cost Baselines</GroupLabel>
+          <Slider label="Training cost today" value={costTrainBase} onChange={setCostTrainBase}
+            min={1e6} max={1e11} log format={fmt} color={C.train}
+            tip="Current dollar cost to train a model at the capability threshold from scratch. GPT-4 scale ≈ $100M; frontier 2025 ≈ $500M-$1B." />
+          <Slider label="Base attack cost today" value={costFtBase} onChange={setCostFtBase}
+            min={100} max={1e7} log format={fmt} color={C.train}
+            tip="Cost of the cheapest gradient-based attack (fine-tuning) on a model at this scale if there were no tamper resistance. Includes compute and data preparation. Typically $10K-$100K for full fine-tune, less with LoRA." />
+
+          <GroupLabel color={C.hw}>Hardware (Has a Ceiling)</GroupLabel>
+          <Slider label="Improvement rate (×/yr)" value={hwRate} onChange={setHwRate}
+            min={1.05} max={2.5} step={0.05} format={v => `${v.toFixed(2)}×`} color={C.hw}
+            tip="Current annual hardware price-performance gain. Epoch AI data: GPU FLOP/$ doubles every ~2.5yr ≈ 1.32×/yr. Including specialization (lower precision, tensor cores): ~1.4×/yr." />
+          <Slider label="Years until plateau" value={yearsToPlateauHw} onChange={setYearsToPlateauHw}
+            min={3} max={25} step={1} format={v => `${v}yr`} color={C.hw}
+            tip="When hardware gains become negligible. Driven by transistor scaling limits (~2nm), memory bandwidth walls, and fab economics. Most estimates: practical limits reached in 8-15 years." />
+
+          <GroupLabel color={C.algo}>Algorithms (No Known Ceiling)</GroupLabel>
+          <Slider label="Efficiency rate (×/yr)" value={algoRate} onChange={setAlgoRate}
+            min={1} max={8} step={0.1} format={v => `${v.toFixed(1)}×`} color={C.algo}
+            tip="Current annual algorithmic efficiency gain. Controlled estimates: ~3×/yr (Epoch, 2025). Catch-up estimates range from 2× to 60×/yr with massive uncertainty." />
+          <Slider label="Years of fast progress" value={algoHalflife} onChange={setAlgoHalflife}
+            min={2} max={25} step={1} format={v => `${v}yr`} color={C.algo}
+            tip="How long algorithmic improvement stays near its current pace before noticeably slowing. After this many years, the rate has dropped to roughly half its starting value. Longer = sustained progress." />
+
+          <GroupLabel color={C.remove}>Attacks & Tamper Resistance</GroupLabel>
+          <Slider label="Attack improvement (×/yr)" value={attackRate} onChange={setAttackRate}
+            min={1} max={5} step={0.1} format={v => `${v.toFixed(1)}×`} color={C.remove}
+            tip="Annual improvement in adversarial fine-tuning methods for removing safeguards (LoRA optimization, loss design, etc). Decelerates on the same timeline as algorithmic progress." />
+          <Slider label="Tamper resistance (×)" value={trBase} onChange={setTrBase}
+            min={1} max={1e5} log format={v => `${v >= 1000 ? (v/1000).toFixed(0) + 'K' : v.toFixed(0)}×`} color={C.green}
+            tip="How many times more expensive fine-tuning becomes due to the safeguard. A 100× multiplier means a $50K fine-tune becomes $5M. Based on Deep Ignorance and TAR benchmarks." />
+          <Slider label="10× bigger model → ___× harder" value={trScaling10x} onChange={setTrScaling10x}
+            min={1} max={10} step={0.1} format={v => `${v.toFixed(1)}×`} color={C.green}
+            tip="If the model is 10× larger, how much harder is the safeguard to break? 1× = no scaling benefit, 2× = twice as hard, 3× = three times. This is the most uncertain parameter in the model." />
+
+          <GroupLabel color={C.yellow}>Capability</GroupLabel>
+          <Slider label="Threshold model size" value={nThreshold} onChange={setNThreshold}
+            min={1e8} max={1e13} log format={v => `${fmtParams(v)} params`} color={C.yellow}
+            tip="Minimum parameter count for the dangerous capability to exist. This is capability-specific — bioweapons may require different scale than cyber offense." />
+
+          <GroupLabel color={C.red}>Threat Actor</GroupLabel>
+          <div style={{ marginBottom: 10 }}>
+            <select value={actorIdx} onChange={e => setActorIdx(Number(e.target.value))} style={{
+              width: "100%", background: C.bgInner, border: `1px solid ${C.border}`,
+              color: C.text, borderRadius: 4, padding: "6px 8px", fontSize: 11,
+              fontFamily: "var(--f)", cursor: "pointer", outline: "none",
+            }}>
+              {ACTORS.map((a, i) => <option key={i} value={i}>{a.label}</option>)}
+            </select>
+          </div>
+          {actorIdx === ACTORS.length - 1 && (
+            <Slider label="Custom budget" value={customBudget} onChange={setCustomBudget}
+              min={100} max={1e11} log format={fmt} color={C.red}
+              tip="Custom threat actor compute budget." />
+          )}
+        </div>
+
+        {/* Main */}
+        <div style={{ flex: 1, padding: "20px 24px", overflowY: "auto", maxHeight: "calc(100vh - 90px)" }}>
+
+          {/* Metrics */}
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 4, alignItems: "stretch" }}>
+            <Metric label="Safeguard relevant for" value={selectedWindow >= 25 ? ">25yr" : `${selectedWindow}yr`}
+              sub={`vs ${ACTORS[actorIdx].label}`} color={C.green} />
+            <div style={{
+              background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6,
+              padding: "14px 16px", flex: 1, minWidth: 150,
+              display: "flex", flexDirection: "column", justifyContent: "center",
+            }}>
+              <div style={{ fontSize: 10, color: C.dim, fontFamily: "var(--f)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5 }}>
+                Cheapest attack path today
+              </div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: C.muted, fontFamily: "var(--f)", lineHeight: 1.3 }}>
+                {data[0]?.costRemove < data[0]?.costTrain
+                  ? "Fine-tune to remove safeguard"
+                  : "Train a new model from scratch"}
+              </div>
+              <div style={{ fontSize: 10, color: C.dim, marginTop: 4, fontFamily: "var(--f)" }}>
+                {data[0]?.costRemove < data[0]?.costTrain
+                  ? `${fmt(data[0]?.costRemove)} vs ${fmt(data[0]?.costTrain)} to train`
+                  : `${fmt(data[0]?.costTrain)} vs ${fmt(data[0]?.costRemove)} to remove`}
+              </div>
+            </div>
+          </div>
+
+          {/* ── Cost Curves ── */}
+          {tab === "model" && (<>
+            <Section sub="Log-scale projection of attacker costs. Safeguard is relevant while costs exceed the actor budget (dashed line).">
+              Attacker Cost Curves
+            </Section>
+            <Chart h={440}>
+              <ComposedChart data={data} margin={{ top: 10, right: 30, left: 10, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                <XAxis dataKey="year" stroke={C.dim} tick={tickStyle} />
+                <YAxis scale="log" domain={['auto', 'auto']} tickFormatter={fmt} stroke={C.dim} tick={tickStyle} />
+                <Tooltip content={<Tip />} />
+                <Legend wrapperStyle={{ fontSize: 10, fontFamily: "var(--f)" }} />
+                <Line type="monotone" dataKey="costTrain" name="Train from scratch" stroke={C.train} strokeWidth={2.5} dot={false} />
+                <Line type="monotone" dataKey="costRemove" name="Remove safeguard" stroke={C.remove} strokeWidth={2.5} dot={false} />
+                <Line type="monotone" dataKey="costAttack" name="Min attack cost" stroke={C.attack} strokeWidth={2} strokeDasharray="6 3" dot={false} />
+                <ReferenceLine y={hwFloor} stroke={C.hw} strokeDasharray="2 4" strokeWidth={1}
+                  label={{ value: "Hardware floor", position: "right", style: { fontSize: 9, fill: C.hw } }} />
+                <ReferenceLine y={budget} stroke={C.red} strokeDasharray="4 4" strokeWidth={1.5}
+                  label={{ value: `Actor budget: ${fmt(budget)}`, position: "insideTopRight", style: { fontSize: 9, fill: C.red } }} />
+              </ComposedChart>
+            </Chart>
+
+            <Section sub="Above the ceiling, additional tamper resistance is wasted — the attacker trains from scratch.">
+              Tamper Resistance Ceiling
+            </Section>
+            <Chart h={260}>
+              <ComposedChart data={data} margin={{ top: 10, right: 30, left: 10, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                <XAxis dataKey="year" stroke={C.dim} tick={tickStyle} />
+                <YAxis scale="log" domain={['auto', 'auto']} tickFormatter={fmtX} stroke={C.dim} tick={tickStyle} />
+                <Tooltip content={<Tip />} />
+                <Legend wrapperStyle={{ fontSize: 10, fontFamily: "var(--f)" }} />
+                <Area type="monotone" dataKey="maxUsefulTR" name="Max useful TR" fill={C.green + "22"} stroke={C.green} strokeWidth={2} />
+                <ReferenceLine y={trBase * Math.pow(nThreshold / 1e9, Math.log10(trScaling10x))}
+                  stroke={C.remove} strokeDasharray="6 3"
+                  label={{ value: "Current tamper resistance", position: "right", style: { fontSize: 9, fill: C.remove } }} />
+              </ComposedChart>
+            </Chart>
+          </>)}
+
+          {/* ── Decomposition ── */}
+          {tab === "decomp" && (<>
+            <Section sub="Hardware-only cost (orange, asymptotes) vs. hardware + algorithmic (purple, keeps falling). The gap is the algorithmic contribution.">
+              Hardware vs. Algorithmic
+            </Section>
+            <Chart h={440}>
+              <ComposedChart data={data} margin={{ top: 10, right: 30, left: 10, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                <XAxis dataKey="year" stroke={C.dim} tick={tickStyle} />
+                <YAxis scale="log" domain={['auto', 'auto']} tickFormatter={fmt} stroke={C.dim} tick={tickStyle} />
+                <Tooltip content={<Tip />} />
+                <Legend wrapperStyle={{ fontSize: 10, fontFamily: "var(--f)" }} />
+                <Line type="monotone" dataKey="costTrainHwOnly" name="Hardware only" stroke={C.hw} strokeWidth={2.5} dot={false} />
+                <Line type="monotone" dataKey="costTrain" name="Hardware + Algorithmic" stroke={C.combined} strokeWidth={2.5} dot={false} />
+                <ReferenceLine y={hwFloor} stroke={C.hw} strokeDasharray="2 4"
+                  label={{ value: `Hardware floor: ${fmt(hwFloor)}`, position: "right", style: { fontSize: 9, fill: C.hw } }} />
+                <ReferenceLine y={budget} stroke={C.red} strokeDasharray="4 4" strokeWidth={1.5}
+                  label={{ value: "Actor budget", position: "insideTopRight", style: { fontSize: 9, fill: C.red } }} />
+              </ComposedChart>
+            </Chart>
+
+            <Section sub="Hardware saturates; algorithms decelerate but persist.">
+              Annual Improvement Rates
+            </Section>
+            <Chart h={280}>
+              <ComposedChart data={data} margin={{ top: 10, right: 30, left: 10, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                <XAxis dataKey="year" stroke={C.dim} tick={tickStyle} />
+                <YAxis domain={[0.9, 'auto']} tickFormatter={v => `${v.toFixed(1)}×`} stroke={C.dim} tick={tickStyle} />
+                <Tooltip content={<Tip />} />
+                <Legend wrapperStyle={{ fontSize: 10, fontFamily: "var(--f)" }} />
+                <Line type="monotone" dataKey="effHwRate" name="Hardware" stroke={C.hw} strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="effAlgoRate" name="Algorithmic" stroke={C.algo} strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="effCombined" name="Combined" stroke={C.combined} strokeWidth={2} strokeDasharray="6 3" dot={false} />
+                <ReferenceLine y={1} stroke={C.red} strokeDasharray="2 4" label={{ value: "No improvement", position: "right", style: { fontSize: 9, fill: C.red } }} />
+              </ComposedChart>
+            </Chart>
+
+            <Section sub="Hardware hits its ceiling; algorithms keep compounding.">
+              Cumulative Factors
+            </Section>
+            <Chart h={280}>
+              <ComposedChart data={data} margin={{ top: 10, right: 30, left: 10, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                <XAxis dataKey="year" stroke={C.dim} tick={tickStyle} />
+                <YAxis scale="log" domain={['auto', 'auto']} tickFormatter={fmtX} stroke={C.dim} tick={tickStyle} />
+                <Tooltip content={<Tip />} />
+                <Legend wrapperStyle={{ fontSize: 10, fontFamily: "var(--f)" }} />
+                <Line type="monotone" dataKey="hwFactor" name="Hardware" stroke={C.hw} strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="cumAlgo" name="Algorithmic" stroke={C.algo} strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="cumTrainReduction" name="Combined" stroke={C.combined} strokeWidth={2} strokeDasharray="6 3" dot={false} />
+                <ReferenceLine y={headroom} stroke={C.hw} strokeDasharray="2 4"
+                  label={{ value: `Hardware ceiling: ${headroom.toFixed(0)}×`, position: "right", style: { fontSize: 9, fill: C.hw } }} />
+              </ComposedChart>
+            </Chart>
+          </>)}
+
+          {/* ── Relevance ── */}
+          {tab === "relevance" && (<>
+            <Section sub="Years each actor type is blocked by the safeguard.">
+              Relevance by Threat Actor
+            </Section>
+            <Chart h={260}>
+              <BarChart data={windows} layout="vertical" margin={{ top: 10, right: 30, left: 10, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                <XAxis type="number" domain={[0, 25]} tick={tickStyle} stroke={C.dim} />
+                <YAxis type="category" dataKey="label" width={160} tick={tickStyle} stroke={C.dim} />
+                <Tooltip content={<Tip />} />
+                <Bar dataKey="years" name="Years" radius={[0, 4, 4, 0]}>
+                  {windows.map((_, i) => <Cell key={i} fill={[C.train, C.remove, C.attack, C.green][i]} />)}
+                </Bar>
+              </BarChart>
+            </Chart>
+
+            <Section sub="Timeline of protection.">Relevance Timeline</Section>
+            <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20 }}>
+              {windows.map((w, idx) => {
+                const pct = Math.min((w.years / 25) * 100, 100);
+                const col = [C.train, C.remove, C.attack, C.green][idx];
+                return (
+                  <div key={idx} style={{ marginBottom: 18 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+                      <span style={{ fontSize: 11, color: col, fontWeight: 600 }}>{w.label}</span>
+                      <span style={{ fontSize: 10, color: C.muted }}>{w.years >= 25 ? ">25yr" : `${w.years}yr`}</span>
+                    </div>
+                    <div style={{ background: C.border, borderRadius: 3, height: 20, position: "relative", overflow: "hidden" }}>
+                      <div style={{
+                        background: `linear-gradient(90deg, ${col}bb, ${col}33)`,
+                        height: "100%", width: `${pct}%`, borderRadius: 3,
+                      }} />
+                      {[5, 10, 15, 20].map(y => (
+                        <div key={y} style={{
+                          position: "absolute", left: `${(y / 25) * 100}%`,
+                          top: 0, bottom: 0, width: 1, background: C.dim + "33",
+                        }} />
+                      ))}
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2 }}>
+                      <span style={{ fontSize: 9, color: C.dim }}>2026</span>
+                      <span style={{ fontSize: 9, color: C.dim }}>2051</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <Section sub="Which attack path dominates over time.">Binding Constraint</Section>
+            <Chart h={150}>
+              <AreaChart data={data.map(d => ({
+                year: d.year,
+                "Removal cheaper": d.costRemove < d.costTrain ? 1 : 0,
+                "Training cheaper": d.costTrain <= d.costRemove ? 1 : 0,
+              }))} margin={{ top: 10, right: 30, left: 10, bottom: 0 }}>
+                <XAxis dataKey="year" stroke={C.dim} tick={tickStyle} />
+                <YAxis hide domain={[0, 1]} />
+                <Area type="step" dataKey="Removal cheaper" fill={C.remove + "44"} stroke={C.remove} strokeWidth={0} />
+                <Area type="step" dataKey="Training cheaper" fill={C.train + "44"} stroke={C.train} strokeWidth={0} />
+                <Legend wrapperStyle={{ fontSize: 10, fontFamily: "var(--f)" }} />
+              </AreaChart>
+            </Chart>
+          </>)}
+
+          {/* ── Required TR ── */}
+          {tab === "requiredTR" && (() => {
+            // Compute required TR for each year and each actor
+            const { headroom: hd, alpha: al } = deriveInternal(p);
+            const reqData = [];
+            for (let t = 0; t <= 25; t++) {
+              const tau = p.yearsToPlateauHw / 3;
+              const hwF = t === 0 ? 1 : 1 + (hd - 1) * (1 - Math.exp(-t / tau));
+              let cumAlgo = 1, cumAttack = 1;
+              for (let i = 1; i <= t; i++) {
+                const ad = Math.pow(0.5, i / p.algoHalflife);
+                cumAlgo *= 1 + (p.algoRate - 1) * ad;
+                cumAttack *= 1 + (p.attackRate - 1) * ad;
+              }
+              const costTrainT = p.costTrainBase / (hwF * cumAlgo);
+              const costFtT = p.costFtBase / (hwF * cumAlgo);
+              const trCeiling = costTrainT / costFtT * cumAttack;
+
+              const row = { year: 2026 + t, t, trCeiling, costTrainT };
+              ACTORS.filter(a => a.budget !== null).forEach(a => {
+                if (costTrainT <= a.budget) {
+                  row[`tr_${a.label}`] = null; // impossible
+                  row[`impossible_${a.label}`] = true;
+                } else {
+                  row[`tr_${a.label}`] = a.budget * cumAttack / costFtT;
+                  row[`impossible_${a.label}`] = false;
+                }
+              });
+              reqData.push(row);
+            }
+
+            // Find the year training becomes affordable for each actor
+            const trainAffordableYear = {};
+            ACTORS.filter(a => a.budget !== null).forEach(a => {
+              const yr = reqData.find(d => d.costTrainT <= a.budget);
+              trainAffordableYear[a.label] = yr ? yr.year : null;
+            });
+
+            // Compute required annual TR growth rate for target windows
+            const targetYears = [3, 5, 10];
+            const trGrowthTable = targetYears.map(T => {
+              const row = { target: `${T} years` };
+              ACTORS.filter(a => a.budget !== null).forEach(a => {
+                const d = reqData[T];
+                if (!d || d[`impossible_${a.label}`]) {
+                  row[a.label] = "Impossible";
+                } else {
+                  const trNeeded = d[`tr_${a.label}`];
+                  // Find worst (highest) TR needed across years 0..T
+                  let worst = 0;
+                  let impossible = false;
+                  for (let i = 0; i <= T; i++) {
+                    if (reqData[i][`impossible_${a.label}`]) { impossible = true; break; }
+                    worst = Math.max(worst, reqData[i][`tr_${a.label}`]);
+                  }
+                  if (impossible) row[a.label] = "Impossible";
+                  else row[a.label] = worst;
+                }
+              });
+              return row;
+            });
+
+            const actorColors = [C.train, C.remove, C.attack, C.green];
+            const presetActors = ACTORS.filter(a => a.budget !== null);
+
+            return (<>
+              <Section mt={12} sub="What level of tamper resistance is needed to keep safeguards relevant for a given number of years? 'Impossible' means training from scratch becomes affordable regardless of TR.">
+                Required Tamper Resistance
+              </Section>
+
+              {/* Summary table */}
+              <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20, marginBottom: 20 }}>
+                <div style={{ fontSize: 12, color: C.text, fontWeight: 600, marginBottom: 12 }}>
+                  Minimum tamper resistance for target relevance windows
+                </div>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, fontFamily: "var(--f)" }}>
+                  <thead>
+                    <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                      <th style={{ textAlign: "left", padding: "6px 8px", color: C.dim }}>Target</th>
+                      {presetActors.map((a, i) => (
+                        <th key={i} style={{ textAlign: "right", padding: "6px 8px", color: actorColors[i], fontWeight: 600 }}>{a.label.split(" (")[0]}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {trGrowthTable.map((row, ri) => (
+                      <tr key={ri} style={{ borderBottom: `1px solid ${C.border}22` }}>
+                        <td style={{ padding: "8px 8px", color: C.text, fontWeight: 600 }}>{row.target}</td>
+                        {presetActors.map((a, i) => (
+                          <td key={i} style={{ padding: "8px 8px", textAlign: "right", fontFamily: "var(--f)" }}>
+                            {row[a.label] === "Impossible"
+                              ? <span style={{ color: C.red, fontSize: 10 }}>No TR helps — training affordable</span>
+                              : <span style={{ color: actorColors[i], fontWeight: 700 }}>{fmtX(row[a.label])}</span>
+                            }
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* When training becomes affordable */}
+              <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20, marginBottom: 20 }}>
+                <div style={{ fontSize: 12, color: C.text, fontWeight: 600, marginBottom: 12 }}>
+                  When training from scratch becomes affordable (safeguard ceiling)
+                </div>
+                <div style={{ fontSize: 11, color: C.muted, marginBottom: 12, lineHeight: 1.6 }}>
+                  After this year, no amount of tamper resistance helps — the attacker can simply train a new model without the safeguard.
+                </div>
+                {presetActors.map((a, i) => {
+                  const yr = trainAffordableYear[a.label];
+                  return (
+                    <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${C.border}22` }}>
+                      <span style={{ color: actorColors[i], fontWeight: 600 }}>{a.label}</span>
+                      <span style={{ color: yr ? C.red : C.green, fontWeight: 600 }}>
+                        {yr ? `${yr} (${yr - 2026} years)` : ">2051"}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Chart: Required TR over time for each actor */}
+              <Section sub="The tamper resistance needed at each year to keep the safeguard relevant. When the line disappears, training from scratch has become affordable and no TR helps.">
+                Required TR Over Time
+              </Section>
+              <Chart h={400}>
+                <ComposedChart data={reqData} margin={{ top: 10, right: 30, left: 10, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                  <XAxis dataKey="year" stroke={C.dim} tick={tickStyle} />
+                  <YAxis scale="log" domain={['auto', 'auto']} tickFormatter={fmtX} stroke={C.dim} tick={tickStyle} />
+                  <Tooltip content={<Tip />} />
+                  <Legend wrapperStyle={{ fontSize: 10, fontFamily: "var(--f)" }} />
+                  {presetActors.map((a, i) => (
+                    <Line key={i} type="monotone" dataKey={`tr_${a.label}`}
+                      name={a.label.split(" (")[0]}
+                      stroke={actorColors[i]} strokeWidth={2} dot={false}
+                      connectNulls={false} />
+                  ))}
+                  <Area type="monotone" dataKey="trCeiling" name="TR ceiling (useless above)"
+                    fill={C.green + "11"} stroke={C.green} strokeWidth={1} strokeDasharray="4 4" />
+                </ComposedChart>
+              </Chart>
+
+              {/* Interpretation */}
+              <Section sub="What the required TR growth rate implies.">
+                Implications
+              </Section>
+              <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20, fontSize: 11, color: C.muted, lineHeight: 1.8 }}>
+                <p style={{ margin: "0 0 10px" }}>
+                  <span style={{ color: C.text, fontWeight: 600 }}>Required TR grows exponentially.</span>{" "}
+                  Because both base attack costs fall and attack methods improve each year, the tamper resistance needed to maintain relevance compounds. Linear or slowly-growing TR is overwhelmed within 1-2 years. Under the current parameters, TR must grow at roughly{" "}
+                  <span style={{ color: C.yellow, fontWeight: 600 }}>
+                    {(() => {
+                      const d5 = reqData[5];
+                      const d0 = reqData[0];
+                      const actor = presetActors[0];
+                      if (!d5 || d5[`impossible_${actor.label}`] || !d0[`tr_${actor.label}`]) return "N/A";
+                      const r = Math.pow(d5[`tr_${actor.label}`] / Math.max(d0[`tr_${actor.label}`], 1), 0.2);
+                      return `${r.toFixed(1)}×/yr`;
+                    })()}
+                  </span>{" "}
+                  to keep up, just to protect against individuals.
+                </p>
+                <p style={{ margin: "0 0 10px" }}>
+                  <span style={{ color: C.text, fontWeight: 600 }}>There is a hard time limit.</span>{" "}
+                  Once training from scratch becomes affordable to an actor, tamper resistance is completely irrelevant for that actor class. This limit is set entirely by training cost decline and is outside the safeguard developer's control. The safeguard community should think of TR as buying time within a closing window, not as a permanent defense.
+                </p>
+                <p style={{ margin: "0 0 10px" }}>
+                  <span style={{ color: C.text, fontWeight: 600 }}>The asymmetric race.</span>{" "}
+                  The entire AI industry is working to reduce training and fine-tuning costs. Tamper resistance must outpace this to remain effective. Currently, perhaps a few dozen researchers work on TR, while the cost-reduction effort is backed by hundreds of billions of dollars. This structural asymmetry means TR improvements must be exceptionally efficient to matter.
+                </p>
+                <p style={{ margin: 0 }}>
+                  <span style={{ color: C.text, fontWeight: 600 }}>Policy implication.</span>{" "}
+                  The value of safeguards is in the time they buy. Policy should focus on what defensive infrastructure can be built within the safeguard window: data governance (restricting dangerous training data), compute monitoring (tracking large training runs), biosurveillance, and hardened defenses that work even after safeguards fail.
+                </p>
+              </div>
+            </>);
+          })()}
+
+          {/* ── TR Investment ── */}
+          {tab === "trInvest" && (<>
+            <Section mt={12} sub={`${HEAT_N.toLocaleString()} parameterizations sampled. Shows how much additional protection time a given TR improvement buys across the range of plausible futures.`}>
+              What Does a TR Improvement Buy You?
+            </Section>
+
+            {/* Mode toggle */}
+            <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+              {[
+                { id: "exact", label: "Exactly N years" },
+                { id: "cumulative", label: "At least N years" },
+              ].map(m => (
+                <button key={m.id} onClick={() => setHeatMode(m.id)} style={{
+                  background: heatMode === m.id ? C.algo + "22" : "transparent",
+                  border: `1px solid ${heatMode === m.id ? C.algo + "66" : C.border}`,
+                  color: heatMode === m.id ? C.algo : C.muted,
+                  borderRadius: 4, padding: "4px 12px", fontSize: 11,
+                  fontFamily: "var(--f)", cursor: "pointer",
+                }}>{m.label}</button>
+              ))}
+            </div>
+
+            {/* Heatmap */}
+            <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20, overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "var(--f)", fontSize: 11 }}>
+                <thead>
+                  <tr>
+                    <th style={{ textAlign: "left", padding: "6px 8px", color: C.dim, borderBottom: `1px solid ${C.border}`, minWidth: 80 }}>
+                      TR improvement →
+                    </th>
+                    {Array.from({ length: HEAT_MAX_YR + 1 }, (_, y) => (
+                      <th key={y} style={{ textAlign: "center", padding: "6px 6px", color: C.muted, borderBottom: `1px solid ${C.border}`, minWidth: 50 }}>
+                        {y === HEAT_MAX_YR ? `${y}+yr` : `${y}yr`}
+                      </th>
+                    ))}
+                    <th style={{ textAlign: "center", padding: "6px 8px", color: C.muted, borderBottom: `1px solid ${C.border}`, minWidth: 60 }}>Mean</th>
+                    <th style={{ textAlign: "center", padding: "6px 8px", color: C.muted, borderBottom: `1px solid ${C.border}`, minWidth: 60 }}>Median</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {heatRows.map((row, ri) => (
+                    <tr key={ri}>
+                      <td style={{ padding: "8px 8px", color: C.algo, fontWeight: 700, borderBottom: `1px solid ${C.border}22` }}>
+                        {row.tr}
+                      </td>
+                      {Array.from({ length: HEAT_MAX_YR + 1 }, (_, y) => {
+                        const label = y === HEAT_MAX_YR ? `${y}+` : `${y}`;
+                        const val = heatMode === "cumulative" ? row[`gte_${y}`] : row[label];
+                        const hc = val === 0 ? C.bgInner : val < 5 ? C.algo + "15" : val < 15 ? C.algo + "30" : val < 30 ? C.algo + "50" : val < 50 ? C.algo + "70" : C.algo + "90";
+                        return (
+                          <td key={y} style={{
+                            padding: "8px 4px", textAlign: "center",
+                            background: hc,
+                            color: val > 0 ? C.text : C.dim,
+                            fontWeight: val >= 30 ? 700 : 400,
+                            borderBottom: `1px solid ${C.border}22`,
+                            borderRight: `1px solid ${C.border}11`,
+                          }}>
+                            {val > 0 ? `${val}%` : "·"}
+                          </td>
+                        );
+                      })}
+                      <td style={{ padding: "8px 6px", textAlign: "center", color: C.yellow, fontWeight: 600, borderBottom: `1px solid ${C.border}22` }}>
+                        {row.mean}yr
+                      </td>
+                      <td style={{ padding: "8px 6px", textAlign: "center", color: C.green, fontWeight: 600, borderBottom: `1px solid ${C.border}22` }}>
+                        {row.median}yr
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Reading guide */}
+            <div style={{ marginTop: 12, fontSize: 10, color: C.dim, lineHeight: 1.6, fontFamily: "var(--f)" }}>
+              {heatMode === "exact"
+                ? `Read as: "A ${TR_MULTS[3]}× TR improvement buys exactly 1 year of additional protection in ${heatRows[3]?.["1"] || 0}% of plausible parameterizations." Darker cells = more likely outcomes.`
+                : `Read as: "A ${TR_MULTS[3]}× TR improvement buys at least 1 year of additional protection in ${heatRows[3]?.gte_1 || 0}% of plausible parameterizations." Use this view to answer "what's the probability my investment buys at least N years?"`
+              }
+            </div>
+
+            {/* Interpretation */}
+            <Section sub="Key patterns in the data.">Interpretation</Section>
+            <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20, fontSize: 11, color: C.muted, lineHeight: 1.8 }}>
+              <p style={{ margin: "0 0 10px" }}>
+                <span style={{ color: C.text, fontWeight: 600 }}>The "0 years" column is the training-path regime.</span>{" "}
+                When a TR improvement buys zero additional time, it means the attacker is already on the training-from-scratch path where tamper resistance is irrelevant.
+                Against {ACTORS[actorIdx].label}, this happens in{" "}
+                <span style={{ color: C.red, fontWeight: 600 }}>{heatRows[0]?.["0"] || 0}%</span> of worlds
+                even for small improvements.
+              </p>
+              <p style={{ margin: "0 0 10px" }}>
+                <span style={{ color: C.text, fontWeight: 600 }}>Diminishing returns per order of magnitude.</span>{" "}
+                Going from 10× to 100× adds roughly as much time as going from 1× to 10×. Time gained scales as log(TR improvement).
+              </p>
+              <p style={{ margin: "0 0 10px" }}>
+                <span style={{ color: C.text, fontWeight: 600 }}>The research investment question.</span>{" "}
+                If a team works for 6 months and achieves 3× with 50% probability or 10× with 15% probability,
+                the expected gain is roughly{" "}
+                {(0.15 * (heatRows[3]?.mean || 0) + 0.5 * (heatRows[1]?.mean || 0) + 0.35 * 0).toFixed(1)} years —
+                weighed against 0.5 years of researcher time.
+              </p>
+              <p style={{ margin: 0 }}>
+                <span style={{ color: C.text, fontWeight: 600 }}>Minimum viable improvement.</span>{" "}
+                For a {">"} 50% chance of buying at least 1 year of protection, you need roughly{" "}
+                <span style={{ color: C.algo, fontWeight: 700 }}>
+                  {(() => {
+                    for (const row of heatRows) {
+                      if (row.gte_1 >= 50) return row.tr;
+                    }
+                    return `>${TR_MULTS[TR_MULTS.length - 1]}×`;
+                  })()}
+                </span>{" "}
+                against {ACTORS[actorIdx].label}.
+              </p>
+            </div>
+          </>)}
+
+          {/* ── Sensitivity ── */}
+          {tab === "sensitivity" && (<>
+            <Section mt={12} sub={`${mcResults.n.toLocaleString()} random parameterizations sampled from plausible ranges. Actor: ${ACTORS[actorIdx].label}.`}>
+              Global Sensitivity Analysis
+            </Section>
+
+            {/* Distribution summary */}
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 20 }}>
+              <Metric label="Median outcome" value={`${mcResults.percentiles.p50}yr`} sub="50th percentile" color={C.green} />
+              <Metric label="Optimistic" value={`${mcResults.percentiles.p90}yr`} sub="90th percentile" color={C.algo} />
+              <Metric label="Pessimistic" value={`${mcResults.percentiles.p10}yr`} sub="10th percentile" color={C.red} />
+              <Metric label="Full range" value={`${mcResults.percentiles.p5}–${mcResults.percentiles.p95}yr`} sub="5th–95th percentile" color={C.muted} />
+            </div>
+
+            {/* Histogram */}
+            <Section sub="Distribution of safeguard relevance windows across all sampled parameterizations.">
+              Outcome Distribution
+            </Section>
+            <Chart h={280}>
+              <BarChart data={mcResults.hist.filter(h => h.count > 0)} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                <XAxis dataKey="year" stroke={C.dim} tick={tickStyle} label={{ value: "Years of relevance", position: "bottom", style: { fontSize: 10, fill: C.dim } }} />
+                <YAxis tickFormatter={v => `${v}%`} stroke={C.dim} tick={tickStyle} />
+                <Tooltip content={<Tip />} />
+                <Bar dataKey="pct" name="% of runs" radius={[3, 3, 0, 0]}>
+                  {mcResults.hist.filter(h => h.count > 0).map((h, i) => (
+                    <Cell key={i} fill={h.year === ">25" ? C.green + "cc" : C.algo + "88"} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </Chart>
+
+            {/* Variance decomposition */}
+            <Section sub="What fraction of the variation in outcomes is explained by each parameter. Higher = more influential = higher-value research target.">
+              Variance Attribution
+            </Section>
+            <Chart h={Math.max(360, mcResults.decomp.length * 38)}>
+              <BarChart data={mcResults.decomp} layout="vertical" margin={{ top: 10, right: 40, left: 180, bottom: 10 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                <XAxis type="number" tickFormatter={v => `${v}%`} tick={tickStyle} stroke={C.dim}
+                  label={{ value: "% of outcome variance explained", position: "bottom", style: { fontSize: 10, fill: C.dim } }} />
+                <YAxis type="category" dataKey="label" width={170} tick={tickStyle} stroke={C.dim} />
+                <Tooltip content={<Tip />} />
+                <Bar dataKey="importancePct" name="Variance explained (%)" radius={[0, 4, 4, 0]}>
+                  {mcResults.decomp.map((d, i) => (
+                    <Cell key={i} fill={i === 0 ? C.red + "cc" : i < 3 ? C.yellow + "99" : C.algo + "55"} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </Chart>
+
+            {/* Ranked findings */}
+            <Section sub="Parameters ranked by how much they affect conclusions.">
+              Key Findings
+            </Section>
+            <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20 }}>
+              {mcResults.decomp.slice(0, 5).map((d, i) => (
+                <div key={i} style={{ padding: "10px 0", borderBottom: i < 4 ? `1px solid ${C.border}` : "none" }}>
+                  <div style={{ fontSize: 12, color: C.text, fontWeight: 600, marginBottom: 3, display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{
+                      background: i === 0 ? C.red + "33" : C.border,
+                      color: i === 0 ? C.red : C.muted,
+                      fontSize: 10, padding: "2px 6px", borderRadius: 3, fontWeight: 700,
+                    }}>#{i + 1}</span>
+                    {d.label}
+                    <span style={{ fontSize: 10, color: C.dim, fontWeight: 400 }}>
+                      ({d.importancePct}% of variance)
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
+                    Low values → {d.loMean}yr average. High values → {d.hiMean}yr average.
+                    {i === 0 && " This is the highest-leverage empirical question — investing in measuring this parameter reduces uncertainty most."}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Cross-actor comparison */}
+            <Section sub="How the distribution shifts across actor types.">
+              Outcomes by Actor Type
+            </Section>
+            <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, fontFamily: "var(--f)" }}>
+                <thead>
+                  <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                    <th style={{ textAlign: "left", padding: "6px 8px", color: C.dim }}>Actor</th>
+                    <th style={{ textAlign: "right", padding: "6px 8px", color: C.dim }}>10th %ile</th>
+                    <th style={{ textAlign: "right", padding: "6px 8px", color: C.dim }}>Median</th>
+                    <th style={{ textAlign: "right", padding: "6px 8px", color: C.dim }}>90th %ile</th>
+                    <th style={{ textAlign: "right", padding: "6px 8px", color: C.dim }}>Mean</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {mcByActor.map((a, i) => (
+                    <tr key={i} style={{ borderBottom: `1px solid ${C.border}22` }}>
+                      <td style={{ padding: "6px 8px", color: [C.train, C.remove, C.attack, C.green][i], fontWeight: 600 }}>{a.label}</td>
+                      <td style={{ padding: "6px 8px", color: C.muted, textAlign: "right" }}>{a.percentiles.p10}yr</td>
+                      <td style={{ padding: "6px 8px", color: C.text, textAlign: "right", fontWeight: 600 }}>{a.percentiles.p50}yr</td>
+                      <td style={{ padding: "6px 8px", color: C.muted, textAlign: "right" }}>{a.percentiles.p90}yr</td>
+                      <td style={{ padding: "6px 8px", color: C.muted, textAlign: "right" }}>{a.mean}yr</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Plausible ranges (advanced toggle) */}
+            <Section sub="The parameter ranges used for sampling. These represent the boundaries of plausible values based on current literature.">
+              Assumed Parameter Ranges
+            </Section>
+            <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <span style={{ fontSize: 11, color: C.muted }}>
+                  {showAdvRanges ? "Edit ranges below. Changes trigger a new Monte Carlo run." : "Using literature-based defaults."}
+                </span>
+                <button onClick={() => setShowAdvRanges(s => !s)} style={{
+                  background: "transparent", border: `1px solid ${C.border}`, color: C.muted,
+                  borderRadius: 4, padding: "3px 10px", fontSize: 10, fontFamily: "var(--f)", cursor: "pointer",
+                }}>
+                  {showAdvRanges ? "Hide" : "Customize ranges"}
+                </button>
+              </div>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, fontFamily: "var(--f)" }}>
+                <thead>
+                  <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                    <th style={{ textAlign: "left", padding: "5px 8px", color: C.dim }}>Parameter</th>
+                    <th style={{ textAlign: "right", padding: "5px 8px", color: C.dim }}>Low</th>
+                    <th style={{ textAlign: "right", padding: "5px 8px", color: C.dim }}>High</th>
+                    {!showAdvRanges && <th style={{ textAlign: "left", padding: "5px 8px", color: C.dim }}>Justification</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {PARAM_RANGES.map((r, i) => {
+                    const ov = rangeOverrides[r.key];
+                    const lo = ov ? ov[0] : r.lo;
+                    const hi = ov ? ov[1] : r.hi;
+                    const fmtV = (v) => r.log && v >= 1e6 ? `${(v/1e6).toFixed(0)}M` : r.log && v >= 1e3 ? `${(v/1e3).toFixed(0)}K` : r.key.includes("Rate") || r.key.includes("rate") || r.key === "hwRate" || r.key === "trScaling10x" ? `${v.toFixed(2)}×` : r.key === "nThreshold" ? fmtParams(v) : r.log ? fmt(v) : v.toFixed?.(1) ?? v;
+                    return (
+                      <tr key={i} style={{ borderBottom: `1px solid ${C.border}22` }}>
+                        <td style={{ padding: "5px 8px", color: C.muted }}>{r.label}</td>
+                        <td style={{ padding: "5px 8px", color: C.text, textAlign: "right" }}>
+                          {showAdvRanges ? (
+                            <input type="number" value={lo} onChange={e => {
+                              const v = Number(e.target.value);
+                              if (!isNaN(v)) setRangeOverrides(prev => ({ ...prev, [r.key]: [v, hi] }));
+                            }} style={{
+                              width: 80, background: C.bgInner, border: `1px solid ${C.border}`,
+                              color: C.text, borderRadius: 3, padding: "2px 6px", fontSize: 10,
+                              fontFamily: "var(--f)", textAlign: "right",
+                            }} />
+                          ) : fmtV(lo)}
+                        </td>
+                        <td style={{ padding: "5px 8px", color: C.text, textAlign: "right" }}>
+                          {showAdvRanges ? (
+                            <input type="number" value={hi} onChange={e => {
+                              const v = Number(e.target.value);
+                              if (!isNaN(v)) setRangeOverrides(prev => ({ ...prev, [r.key]: [lo, v] }));
+                            }} style={{
+                              width: 80, background: C.bgInner, border: `1px solid ${C.border}`,
+                              color: C.text, borderRadius: 3, padding: "2px 6px", fontSize: 10,
+                              fontFamily: "var(--f)", textAlign: "right",
+                            }} />
+                          ) : fmtV(hi)}
+                        </td>
+                        {!showAdvRanges && <td style={{ padding: "5px 8px", color: C.dim, fontSize: 10, lineHeight: 1.4 }}>{r.src}</td>}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              {showAdvRanges && Object.keys(rangeOverrides).length > 0 && (
+                <button onClick={() => setRangeOverrides({})} style={{
+                  marginTop: 10, background: "transparent", border: `1px solid ${C.border}`,
+                  color: C.red, borderRadius: 4, padding: "4px 12px", fontSize: 10,
+                  fontFamily: "var(--f)", cursor: "pointer",
+                }}>Reset to defaults</button>
+              )}
+            </div>
+          </>)}
+
+          {/* ── Details ── */}
+          {tab === "details" && (<>
+            <Section>Model Equations</Section>
+            <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20, lineHeight: 1.9, fontSize: 12 }}>
+              {[
+                { c: C.train, t: "Core Inequality",
+                  eq: "Safeguard relevant ⟺ min(Cost_remove(t), Cost_train(t)) > Budget" },
+                { c: C.hw, t: "Hardware (Asymptotic)",
+                  eq: `hw_factor(t) = 1 + (headroom - 1) × (1 - e^(-t/τ))\n\nheadroom = hw_rate ^ years_to_plateau = ${headroom.toFixed(0)}×\nτ = years_to_plateau / 3 = ${(yearsToPlateauHw/3).toFixed(1)}yr\nFloor cost = ${fmt(hwFloor)}` },
+                { c: C.algo, t: "Algorithmic (Decelerating)",
+                  eq: `algo_rate(t) = 1 + (initial_rate - 1) × 0.5^(t / halflife)\nDecays toward 1× (no improvement).\n\nCurrent: ${algoRate.toFixed(1)}×/yr, half-life: ${algoHalflife}yr\nAt year 10: ~${(1 + (algoRate - 1) * Math.pow(0.5, 10/algoHalflife)).toFixed(2)}×/yr` },
+                { c: C.combined, t: "Combined Training Cost",
+                  eq: "Cost_train(t) = base / (hw_factor(t) × Π algo_rate(i))" },
+                { c: C.remove, t: "Cost to Remove Safeguard",
+                  eq: `Cost_remove(t) = Cost_ft(t) × TR / attack_improvement(t)\n\nTR = ${trBase} × (N / 1B)^${Math.log10(trScaling10x).toFixed(3)}\n   = ${(trBase * Math.pow(nThreshold / 1e9, Math.log10(trScaling10x))).toFixed(0)}× at ${fmtParams(nThreshold)} params\n\nAttack methods decelerate on same halflife as algo.` },
+                { c: C.green, t: "Tamper Resistance Ceiling",
+                  eq: "Max_useful_TR = Cost_train / Cost_ft × attack_improvement\n\nBeyond this, attacker trains from scratch.\nAdditional TR investment is wasted." },
+              ].map(({ c, t, eq }, i) => (
+                <div key={i} style={{ marginBottom: 14 }}>
+                  <div style={{ color: c, fontWeight: 600, marginBottom: 4, fontSize: 12 }}>{t}</div>
+                  <div style={{
+                    color: C.muted, fontFamily: "var(--f)", fontSize: 11,
+                    padding: "10px 14px", background: C.bgInner, borderRadius: 5,
+                    whiteSpace: "pre-wrap", lineHeight: 1.7, borderLeft: `2px solid ${c}33`,
+                  }}>{eq}</div>
+                </div>
+              ))}
+            </div>
+
+            <Section>Assumptions & Caveats</Section>
+            <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20, lineHeight: 1.8, fontSize: 11, color: C.muted }}>
+              {[
+                { c: C.red, t: "Critical", d: "Assumes any parameter-level safeguard can eventually be removed through fine-tuning. May not hold for all architectures." },
+                { c: C.text, t: "Open weights only", d: "Attacker has full parameter access. Closed models have additional protections not modeled." },
+                { c: C.hw, t: "Hardware ceiling", d: "Modeled with finite total headroom based on transistor limits (~2nm CMOS), memory bandwidth (~28%/yr), cooling, and fab economics ($20B+/gen). GPUs are ~10⁸× above Landauer, but practical headroom is ~100-1000×." },
+                { c: C.algo, t: "Algorithmic uncertainty", d: "No known physical ceiling. Controlled estimates: ~3×/yr. But Epoch research shows most gains came from ~2 scale-dependent innovations plus better data, not steady discovery of new algorithms." },
+                { c: C.text, t: "Data costs omitted", d: "Training requires data, not just compute. For dangerous capabilities, data scarcity may be a natural chokepoint not captured here." },
+                { c: C.text, t: "TR scaling unknown", d: "Most tamper-resistance research (TAR, Circuit Breakers, Deep Ignorance) covers only 6-8B scale. Scaling behavior is the least grounded parameter." },
+                { c: C.text, t: "Static budgets", d: "Actor budgets are constant. Cloud democratization may shift effective budgets over time." },
+              ].map(({ c, t, d }, i) => (
+                <p key={i} style={{ marginTop: i === 0 ? 0 : 6, marginBottom: 6 }}>
+                  <span style={{ color: c, fontWeight: 600 }}>{t}: </span>{d}
+                </p>
+              ))}
+            </div>
+          </>)}
+
+        </div>
+      </div>
+    </div>
+  );
+}
