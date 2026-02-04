@@ -1178,9 +1178,7 @@ export default function ModelSafeguardsDashboard() {
                       <strong style={{ color: "#6ECFB0" }}>However, this assumption may not hold for all safeguard architectures:</strong>
                     </p>
                     <ul style={{ margin: "0 0 12px 0", paddingLeft: 20, color: "#9a9eb0" }}>
-                      <li><strong style={{ color: "#c4c8d4" }}>Pretraining data filtering</strong> (Deep Ignorance approach): If dangerous knowledge was never learned, 
-                      fine-tuning can't "unlock" it — the attacker would need to teach the model from scratch, approaching training-from-scratch costs.</li>
-                      <li><strong style={{ color: "#c4c8d4" }}>Distributed representations</strong>: If safety-relevant features are deeply entangled with capability features, 
+                     <li><strong style={{ color: "#c4c8d4" }}>Distributed representations</strong>: If safety-relevant features are deeply entangled with capability features, 
                       low-rank fine-tuning (LoRA) may be unable to target them without destroying capabilities.</li>
                       <li><strong style={{ color: "#c4c8d4" }}>Architectural safeguards</strong>: Hardware-level interventions, inference-time monitors, or 
                       cryptographic commitments can't be fine-tuned away at all.</li>
