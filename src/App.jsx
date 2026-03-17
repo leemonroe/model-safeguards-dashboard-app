@@ -579,27 +579,7 @@ export default function App() {
             tip="Annual improvement in adversarial fine-tuning methods for removing safeguards (LoRA optimization, loss design, etc). Decelerates on the same timeline as algorithmic progress." />
           <Slider label="Steps to circumvent safeguard" value={stepsToCircumvent} onChange={setStepsToCircumvent}
             min={10} max={1e7} log format={v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1000 ? `${(v/1000).toFixed(0)}K` : `${v.toFixed(0)}`} color={C.green}
-            tip="Fine-tuning steps needed to break the safeguard. Post-training safety tuning: ~50-200. TAR (Tamirisa et al.): ~1K-5K. Deep Ignorance (EleutherAI): ~10K. This is what TR papers actually measure." />
-          {/* Reference markers */}
-          <div style={{ display: "flex", justifyContent: "space-between", marginTop: -10, marginBottom: 4, padding: "0 2px" }}>
-            {[
-              { label: "No safeguard", steps: 100 },
-              { label: "TAR", steps: 3000 },
-              { label: "Deep Ignorance", steps: 10000 },
-            ].map((ref, i) => {
-              const frac = logFrac(10, 1e7, ref.steps);
-              return (
-                <div key={i} style={{
-                  position: "relative", left: `${frac * 100}%`,
-                  transform: "translateX(-50%)",
-                  textAlign: "center", fontSize: 8, color: C.dim, lineHeight: 1.3,
-                }}>
-                  <div style={{ width: 1, height: 4, background: C.dim, margin: "0 auto 1px" }} />
-                  {ref.label}
-                </div>
-              );
-            })}
-          </div>
+            tip="Fine-tuning steps needed to break the safeguard. Reference points: No safeguard ~100 steps. Post-training safety tuning ~50-200. TAR (Tamirisa et al.) ~1K-5K. Deep Ignorance (EleutherAI) ~10K. This is what TR papers actually measure." />
           {/* Live cost readout */}
           <div style={{
             background: C.green + "12", border: `1px solid ${C.green}33`,
