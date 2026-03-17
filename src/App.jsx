@@ -685,8 +685,7 @@ export default function App() {
                 <Tooltip content={<Tip />} />
                 <Legend wrapperStyle={{ fontSize: 10, fontFamily: "var(--f)" }} />
                 <Line type="monotone" dataKey="costTrain" name="Train from scratch" stroke={C.train} strokeWidth={2.5} dot={false} />
-                <Line type="monotone" dataKey="costRemove" name="Remove safeguard" stroke={C.remove} strokeWidth={2.5} dot={false} />
-                <Line type="monotone" dataKey="costAttack" name="Cheapest attack (fine-tune or retrain)" stroke={C.attack} strokeWidth={2} strokeDasharray="6 3" dot={false} />
+                <Line type="monotone" dataKey="costRemove" name="Fine-tune to remove safeguard" stroke={C.remove} strokeWidth={2.5} dot={false} />
                 <ReferenceLine y={hwFloor} stroke={C.hw} strokeDasharray="2 4" strokeWidth={1}
                   label={{ value: "Hardware floor", position: "right", style: { fontSize: 9, fill: C.hw } }} />
                 <ReferenceLine y={budget} stroke={C.red} strokeDasharray="4 4" strokeWidth={1.5}
