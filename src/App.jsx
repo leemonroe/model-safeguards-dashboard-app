@@ -510,6 +510,7 @@ export default function App() {
     { id: "trInvest", label: "TR Investment" },
     { id: "sensitivity", label: "Sensitivity" },
     { id: "details", label: "Details" },
+    { id: "sources", label: "Sources" },
   ];
 
   return (
@@ -1338,6 +1339,331 @@ export default function App() {
                 <p key={i} style={{ marginTop: i === 0 ? 0 : 6, marginBottom: 6 }}>
                   <span style={{ color: c, fontWeight: 600 }}>{t}: </span>{d}
                 </p>
+              ))}
+            </div>
+          </>)}
+
+          {/* ── Sources ── */}
+          {tab === "sources" && (<>
+            <Section sub="Citable sources and justifications for every parameter range and model equation. Confidence levels reflect how well-grounded each assumption is.">
+              Parameter Sources & Justifications
+            </Section>
+
+            {/* Confidence legend */}
+            <div style={{ display: "flex", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
+              {[
+                { label: "High", color: C.green, desc: "Well-sourced empirical data" },
+                { label: "Medium", color: C.yellow, desc: "Reasonable estimates, some uncertainty" },
+                { label: "Low", color: C.red, desc: "Expert guess or thin evidence" },
+              ].map(({ label, color, desc }) => (
+                <div key={label} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: C.muted }}>
+                  <span style={{ width: 8, height: 8, borderRadius: 2, background: color, display: "inline-block" }} />
+                  <span style={{ color, fontWeight: 600 }}>{label}</span> — {desc}
+                </div>
+              ))}
+            </div>
+
+            {[
+              {
+                param: "Training cost today",
+                range: "$10M – $50B",
+                confidence: "medium",
+                lo: "MosaicML MPT-7B (~$1-5M compute); 13B models ~$5-10M. $10M captures smallest models with potentially dangerous capabilities.",
+                hi: "$50B captures projected near-future frontier runs with massive overtraining. Current frontier (GPT-4, Llama 3 405B) estimated at $100M-$500M all-in.",
+                central: "$500M — Meta Llama 3 405B disclosed 30.84M GPU-hours on H100 (~$60-200M compute). Frontier models with failed runs, salaries, infrastructure: $200M-$500M.",
+                sources: [
+                  "Meta, 'The Llama 3 Herd of Models,' arXiv:2407.21783 (2024) — 30.84M GPU-hours disclosed",
+                  "Sevilla et al., 'Compute Trends Across Three Eras of Machine Learning,' arXiv:2202.05924 (2022), Epoch AI dataset",
+                  "Semianalysis, 'GPT-4 Architecture, Infrastructure, Training Dataset, Costs...' (2023)",
+                ],
+              },
+              {
+                param: "Attack setup cost",
+                range: "$2K – $20K",
+                confidence: "low",
+                lo: "$2K represents a skilled individual spending ~1 week sourcing data + minimal cloud costs for experimentation.",
+                hi: "$20K includes comprehensive dataset curation ($1-5K), H100 cloud rental for experimentation ($2-10K), and specialized expertise ($5-10K).",
+                central: "$5K — no published work systematically breaks down adversarial fine-tuning preparation costs. This is an author estimate.",
+                sources: [
+                  "Qi et al., 'Fine-tuning Aligned Language Models Compromises Safety,' arXiv:2310.03693 (2023) — demonstrated trivial compute cost for the attack itself",
+                  "Yang et al., 'Shadow Alignment,' arXiv:2310.02949 (2023) — similar results on attack simplicity",
+                  "No systematic attack cost decomposition exists in the literature [GAP]",
+                ],
+              },
+              {
+                param: "Compute cost per 1K steps (at 70B)",
+                range: "$20 – $500",
+                confidence: "medium-high",
+                lo: "$20 — 8×H100 at $2/hr spot pricing, ~20 steps/min throughput. 1K steps ≈ 50 min ≈ $13-27. Efficient setups with spot pricing.",
+                hi: "$500 — 16×H100 at $4/hr on-demand, conservative 5 steps/min with overhead. Includes communication overhead and redundancy at scale.",
+                central: "MC excludes QLoRA ($0.50-$5/1K) for safeguard-optimistic analysis. Full fine-tuning is the assumed attack method. This is a conservative modeling choice — if QLoRA suffices, real costs are 10-100× lower.",
+                sources: [
+                  "Lambda Cloud, RunPod, CoreWeave pricing (2024) — H100 spot: $1.99-$2.49/hr",
+                  "Hugging Face, 'Fine-tuning Llama 2 70B using PyTorch FSDP' (2023) — throughput benchmarks",
+                  "Hu et al., 'LoRA,' arXiv:2106.09685 (2021)",
+                  "Dettmers et al., 'QLoRA,' arXiv:2305.14314 (2023)",
+                ],
+              },
+              {
+                param: "Hardware improvement rate",
+                range: "1.1× – 1.55×/yr",
+                confidence: "high",
+                lo: "1.1×/yr — post-Moore's-Law rates if current scaling approaches hit memory bandwidth walls and diminishing lithography returns.",
+                hi: "1.55×/yr — optimistic case with chiplet architectures, HBM4 memory, and competitive GPU market dynamics.",
+                central: "1.32×/yr — directly from Epoch AI: GPU FLOP/$ doubles every ~2.5yr. 2^(1/2.5) ≈ 1.32×/yr over 2006-2021.",
+                sources: [
+                  "Hobbhahn, Besiroglu et al., 'Trends in Machine Learning Hardware,' Epoch AI (2023) — primary source",
+                  "Epoch AI Compute Trends dataset — GPU FLOP/$ historical time series",
+                ],
+              },
+              {
+                param: "Years until hardware plateaus",
+                range: "5 – 15yr",
+                confidence: "medium",
+                lo: "5yr (~2030) — near-term exhaustion of EUV lithographic scaling, with memory bandwidth as binding constraint for AI workloads.",
+                hi: "15yr (~2040) — continued innovation via chiplets, 3D stacking, CFET transistors, 2D materials, and photonic interconnects sustaining improvement beyond lithographic limits.",
+                central: "~10yr — consensus: conventional scaling exhausts by ~2030, packaging and architecture innovations sustain gains for another ~5 years.",
+                sources: [
+                  "IEEE IRDS 'More Moore' and 'Beyond CMOS' chapters (2022 edition)",
+                  "TSMC technology roadmap presentations (2023-2024 investor calls)",
+                  "Hobbhahn et al., Epoch AI (2023) — hardware headroom discussion",
+                ],
+              },
+              {
+                param: "Algorithmic efficiency rate",
+                range: "1.5× – 4.5×/yr",
+                confidence: "medium-high",
+                lo: "1.5×/yr — deceleration from current pace if recent gains are largely catch-up effects (adopting known techniques to LLMs).",
+                hi: "4.5×/yr — high end of Epoch estimates, includes architecture-level jumps. Epoch headline: effective compute doubles every ~5-8 months for language modeling.",
+                central: "~3×/yr — Epoch AI's most-cited figure. Compute required halves every ~8 months. Note: conflates catch-up gains with genuine frontier innovation.",
+                sources: [
+                  "Ho, Besiroglu et al., 'Algorithmic Progress in Language Models,' arXiv:2403.05812 (2024) — primary source",
+                  "Erdil & Besiroglu, 'Algorithmic Progress in Computer Vision,' arXiv:2212.05153 (2022)",
+                  "Hernandez & Brown, 'Measuring the Algorithmic Efficiency of Neural Networks,' arXiv:2005.04305 (2020)",
+                ],
+              },
+              {
+                param: "Years of fast algorithmic progress",
+                range: "3 – 20yr",
+                confidence: "low",
+                lo: "3yr — 'low-hanging fruit' from transformer scaling is nearly exhausted. Historical precedent: CNN revolution (2012) saw rapid gains for ~5yr before plateauing (VGG → ResNet → EfficientNet).",
+                hi: "20yr — AI-assisted ML research sustains rapid progress; enormous search space for architectures, training algorithms, data strategies. No strong empirical basis.",
+                central: "8yr — rough midpoint. Fundamentally a forecasting question about the pace of scientific discovery. No reliable methodology exists.",
+                sources: [
+                  "Bloom et al., 'Are Ideas Getting Harder to Find?' AER (2020) — empirical support for decelerating discovery rates",
+                  "Cotra, 'Forecasting Transformative AI,' Open Philanthropy (2020) — discusses efficiency trends in long-run context",
+                  "No direct empirical source for this parameter [STRUCTURAL ASSUMPTION]",
+                ],
+              },
+              {
+                param: "Attack method improvement",
+                range: "1.0× – 2.5×/yr",
+                confidence: "low",
+                lo: "1.0×/yr — adversarial fine-tuning methods stagnate; current methods (LoRA, full FT) are near-optimal.",
+                hi: "2.5×/yr — based on 2021-2024 timeline: LoRA (Jun 2021) → QLoRA (May 2023) → GaLore (Mar 2024), each reducing requirements by 2-10×. Capped at 2.5× for safeguard-optimistic analysis.",
+                central: "2.0×/yr — author estimate. No Epoch-quality analysis of adversarial method improvement rates exists. Note: the model couples attack deceleration to algoHalflife, which is a simplifying assumption with no empirical basis.",
+                sources: [
+                  "Hu et al., 'LoRA,' arXiv:2106.09685 (2021)",
+                  "Dettmers et al., 'QLoRA,' arXiv:2305.14314 (2023)",
+                  "Zhao et al., 'GaLore,' arXiv:2403.03507 (2024)",
+                  "No systematic survey of adversarial fine-tuning efficiency exists [MAJOR GAP]",
+                ],
+              },
+              {
+                param: "Steps to circumvent safeguard",
+                range: "100 – 100M",
+                confidence: "medium (lo) / low (hi)",
+                lo: "100 steps — standard RLHF/DPO safety training is trivially removable. Qi et al. (2023): removed safety alignment with <100 examples, <100 steps.",
+                hi: "100M steps — no artificial cap on achievable TR. At 100M steps on 70B, compute cost (~$2M-$50M) approaches training cost, so the model enters the training-limited regime. This is the natural ceiling, not an empirical bound.",
+                central: "10,000 steps — Deep Ignorance (arXiv:2508.06601, ICLR 2026) demonstrated resistance to 10K steps / 300M tokens on biothreat text at 6.9B scale. Best published result as of 2026.",
+                sources: [
+                  "Qi et al., 'Fine-tuning Aligned Language Models Compromises Safety,' arXiv:2310.03693 (2023) — baseline removability",
+                  "Tamirisa et al., 'Tamper-Resistant Safeguards for Open-Weight LLMs,' arXiv:2408.00761 (ICLR 2025) — TAR, tested at 8B",
+                  "Lynch et al., 'Deep Ignorance: Filtering Pretraining Data Builds Tamper-Resistant Safeguards,' arXiv:2508.06601 (ICLR 2026) — 10K steps at 6.9B",
+                  "TamperBench, arXiv:2602.06911 (2026) — notes real-world resistance may be 'only several hundred steps' for current methods",
+                  "Rosati et al., 'Representation Noising,' arXiv:2405.14577 (2024)",
+                ],
+              },
+              {
+                param: "TR scaling with model size",
+                range: "1.0× – 5.0× per 10× params",
+                confidence: "very low",
+                lo: "1.0× — no scaling benefit. TR difficulty may depend on the method, not the model size.",
+                hi: "5.0× — theoretical argument: larger models have more redundant representations, making selective unlearning harder. Plausible but entirely unproven.",
+                central: "2.0× — author estimate. No empirical data exists above 8B scale. TAR tested at 8B only. Deep Ignorance at 6.9B only.",
+                sources: [
+                  "No empirical source exists [CRITICAL GAP]",
+                  "Theoretical argument discussed informally in Tamirisa et al. (2024) but not tested",
+                  "This is the #1 priority for empirical research — a study testing TR at 1B/7B/70B/405B would transform model validity",
+                ],
+              },
+              {
+                param: "Capability threshold",
+                range: "1B – 500B",
+                confidence: "medium",
+                lo: "1B — some narrow capabilities appear at small scales, but likely too small for meaningful dangerous capability. Included to capture uncertainty.",
+                hi: "500B — largest dense models (Llama 3 405B). Truly dangerous capabilities (e.g., novel pathogen design) may require very large models. Reasonable cap.",
+                central: "70B — Llama 2/3 70B is the most studied open-weight model with significant capabilities. Comparable to GPT-3.5-era closed models.",
+                sources: [
+                  "Mouton et al., 'The Operational Risks of AI in Large-Scale Biological Attacks,' RAND (2024)",
+                  "Li et al., 'The WMDP Benchmark,' arXiv:2403.03218 (2024) — measures dangerous knowledge",
+                  "Wei et al., 'Emergent Abilities of Large Language Models,' TMLR (2022)",
+                  "Schaeffer et al., 'Are Emergent Abilities a Mirage?' arXiv:2304.15004 (2023)",
+                ],
+              },
+            ].map(({ param, range, confidence, lo, hi, central, sources }, idx) => {
+              const confColor = confidence.startsWith("high") ? C.green
+                : confidence.startsWith("medium") ? C.yellow
+                : confidence.startsWith("very") ? C.red : C.red;
+              return (
+                <div key={idx} style={{
+                  background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6,
+                  padding: "16px 18px", marginBottom: 12,
+                  borderLeft: `3px solid ${confColor}33`,
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{param}</span>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 11, color: C.muted, fontFamily: "var(--f)" }}>MC range: {range}</span>
+                      <span style={{
+                        fontSize: 9, fontWeight: 700, color: confColor, textTransform: "uppercase",
+                        background: confColor + "18", padding: "2px 6px", borderRadius: 3,
+                      }}>{confidence}</span>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.7, marginBottom: 8 }}>
+                    <div><span style={{ color: C.text, fontWeight: 600 }}>Lower bound: </span>{lo}</div>
+                    <div><span style={{ color: C.text, fontWeight: 600 }}>Upper bound: </span>{hi}</div>
+                    <div><span style={{ color: C.text, fontWeight: 600 }}>Central estimate: </span>{central}</div>
+                  </div>
+                  <div style={{ fontSize: 10, color: C.dim, lineHeight: 1.6, paddingTop: 6, borderTop: `1px solid ${C.border}22` }}>
+                    {sources.map((s, i) => (
+                      <div key={i} style={{ marginBottom: 2 }}>
+                        {s.includes("[GAP]") || s.includes("[CRITICAL GAP]") || s.includes("[MAJOR GAP]") || s.includes("[STRUCTURAL ASSUMPTION]")
+                          ? <span style={{ color: C.red }}>{s}</span>
+                          : <span>{s}</span>
+                        }
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+
+            <Section mt={28}>Model Equation Sources</Section>
+            {[
+              {
+                eq: "Hardware asymptotic model",
+                form: "hw_factor(t) = 1 + (headroom - 1) × (1 - e^(-t/τ))",
+                confidence: "medium",
+                justification: "Standard saturating exponential. Widely used in engineering for approach-to-limit dynamics. τ = plateau/3 means 'years to plateau' corresponds to ~95% of total gains captured. headroom = rate^years extrapolates current annual rate to compute total remaining improvement.",
+                sources: [
+                  "Standard engineering model — no specific paper needed",
+                  "Farmer & Lafond, 'How Predictable is Technological Progress?' Research Policy (2016) — S-curve alternatives",
+                ],
+              },
+              {
+                eq: "Algorithmic deceleration",
+                form: "algo_rate(t) = 1 + (rate - 1) × 0.5^(t / halflife)",
+                confidence: "medium",
+                justification: "Exponential decay of the excess rate above 1×. Unlike hardware, algorithmic progress has no known physical ceiling, so a plateau model is inappropriate. Instead, the rate itself decays — progress continues forever but decelerates. Similar to models in endogenous growth theory.",
+                sources: [
+                  "Bloom et al., 'Are Ideas Getting Harder to Find?' AER (2020) — empirical support for decelerating discovery",
+                  "Jones, 'R&D-Based Models of Economic Growth,' JPE (1995) — semi-endogenous growth with decelerating progress",
+                ],
+              },
+              {
+                eq: "O(N) compute scaling",
+                form: "effective_cost = computePer1K × (N / 70B)",
+                confidence: "high",
+                justification: "Per-step compute for fine-tuning scales linearly with parameter count: each step is a forward + backward pass over all parameters. Well-established. Caveat: memory requirements scale worse than linearly (optimizer states), so total cost may scale slightly super-linearly due to more GPUs and communication overhead.",
+                sources: [
+                  "Kaplan et al., 'Scaling Laws for Neural Language Models,' arXiv:2001.08361 (2020)",
+                  "Standard computational complexity result for neural network forward/backward pass",
+                ],
+              },
+              {
+                eq: "Attack deceleration tied to algo halflife",
+                form: "attack_rate(t) uses algoHalflife for its decay",
+                confidence: "low",
+                justification: "Assumes adversarial fine-tuning improvements decelerate on the same timeline as general algorithmic progress, since they draw from the same research community. This is weakly justified — attack research could decelerate faster (small community) or slower (adversarial competition incentives). A separate attackHalflife parameter would be more honest but adds complexity.",
+                sources: [
+                  "No empirical source — simplifying assumption [STRUCTURAL ASSUMPTION]",
+                  "The shared halflife is a known limitation acknowledged in the model",
+                ],
+              },
+            ].map(({ eq, form, confidence, justification, sources }, idx) => {
+              const confColor = confidence === "high" ? C.green : confidence === "medium" ? C.yellow : C.red;
+              return (
+                <div key={idx} style={{
+                  background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6,
+                  padding: "16px 18px", marginBottom: 12,
+                  borderLeft: `3px solid ${confColor}33`,
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{eq}</span>
+                    <span style={{
+                      fontSize: 9, fontWeight: 700, color: confColor, textTransform: "uppercase",
+                      background: confColor + "18", padding: "2px 6px", borderRadius: 3,
+                    }}>{confidence}</span>
+                  </div>
+                  <div style={{
+                    fontSize: 11, color: C.algo, fontFamily: "var(--f)",
+                    padding: "6px 10px", background: C.bgInner, borderRadius: 4, marginBottom: 8,
+                  }}>{form}</div>
+                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.7, marginBottom: 8 }}>{justification}</div>
+                  <div style={{ fontSize: 10, color: C.dim, lineHeight: 1.6, paddingTop: 6, borderTop: `1px solid ${C.border}22` }}>
+                    {sources.map((s, i) => (
+                      <div key={i} style={{ marginBottom: 2, color: s.includes("[STRUCTURAL") ? C.red : C.dim }}>{s}</div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+
+            <Section mt={28}>Key Literature Gaps</Section>
+            <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20, lineHeight: 1.8, fontSize: 11, color: C.muted }}>
+              {[
+                { priority: "1", gap: "TR scaling with model size", d: "No empirical data above 8B. A study testing TAR or Deep Ignorance at 1B / 7B / 70B / 405B would be the single highest-value contribution to reducing model uncertainty." },
+                { priority: "2", gap: "Attack method improvement rate", d: "No Epoch-quality retrospective analysis exists. A systematic study of fine-tuning efficiency gains (2019-2026) would fill this gap." },
+                { priority: "3", gap: "Attack setup cost decomposition", d: "No published work breaks down the non-compute costs of an adversarial fine-tuning attack. Even a hypothetical/anonymized red-team cost analysis would help." },
+                { priority: "4", gap: "Attack deceleration independence", d: "The model ties attack method improvement to the same halflife as general algorithmic progress. No evidence supports this coupling; a separate attackHalflife would be more honest." },
+              ].map(({ priority, gap, d }, i) => (
+                <p key={i} style={{ marginTop: i === 0 ? 0 : 6, marginBottom: 6 }}>
+                  <span style={{ color: C.red, fontWeight: 600 }}>#{priority} — {gap}: </span>{d}
+                </p>
+              ))}
+            </div>
+
+            <Section mt={28}>Full Bibliography</Section>
+            <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20, fontSize: 10, color: C.dim, lineHeight: 1.8 }}>
+              {[
+                "Bloom, Jones, Van Reenen & Webb (2020). 'Are Ideas Getting Harder to Find?' American Economic Review, 110(4).",
+                "Cotra (2020). 'Forecasting Transformative AI with Biological Anchors.' Open Philanthropy.",
+                "Dettmers et al. (2023). 'QLoRA: Efficient Finetuning of Quantized Language Models.' arXiv:2305.14314.",
+                "Erdil & Besiroglu (2022). 'Algorithmic Progress in Computer Vision.' arXiv:2212.05153.",
+                "Farmer & Lafond (2016). 'How Predictable is Technological Progress?' Research Policy, 45(3).",
+                "Hernandez & Brown (2020). 'Measuring the Algorithmic Efficiency of Neural Networks.' arXiv:2005.04305.",
+                "Ho, Besiroglu et al. (2024). 'Algorithmic Progress in Language Models.' arXiv:2403.05812.",
+                "Hobbhahn, Besiroglu et al. (2023). 'Trends in Machine Learning Hardware.' Epoch AI.",
+                "Hu et al. (2021). 'LoRA: Low-Rank Adaptation of Large Language Models.' arXiv:2106.09685.",
+                "Jones (1995). 'R&D-Based Models of Economic Growth.' Journal of Political Economy.",
+                "Kaplan et al. (2020). 'Scaling Laws for Neural Language Models.' arXiv:2001.08361.",
+                "Li et al. (2024). 'The WMDP Benchmark.' arXiv:2403.03218.",
+                "Lynch et al. (2025). 'Deep Ignorance: Filtering Pretraining Data Builds Tamper-Resistant Safeguards.' arXiv:2508.06601.",
+                "Meta AI (2024). 'The Llama 3 Herd of Models.' arXiv:2407.21783.",
+                "Mouton, Chase & Horton (2024). 'The Operational Risks of AI in Large-Scale Biological Attacks.' RAND.",
+                "Qi et al. (2023). 'Fine-tuning Aligned Language Models Compromises Safety.' arXiv:2310.03693.",
+                "Rosati et al. (2024). 'Representation Noising Effectively Prevents Harmful Fine-tuning.' arXiv:2405.14577.",
+                "Schaeffer et al. (2023). 'Are Emergent Abilities a Mirage?' arXiv:2304.15004.",
+                "Sevilla et al. (2022). 'Compute Trends Across Three Eras of Machine Learning.' arXiv:2202.05924.",
+                "Tamirisa et al. (2024). 'Tamper-Resistant Safeguards for Open-Weight LLMs.' arXiv:2408.00761.",
+                "TamperBench (2026). arXiv:2602.06911.",
+                "Wei et al. (2022). 'Emergent Abilities of Large Language Models.' TMLR.",
+                "Yang et al. (2023). 'Shadow Alignment.' arXiv:2310.02949.",
+                "Zhao et al. (2024). 'GaLore.' arXiv:2403.03507.",
+              ].map((ref, i) => (
+                <div key={i} style={{ marginBottom: 3 }}>[{i + 1}] {ref}</div>
               ))}
             </div>
           </>)}
