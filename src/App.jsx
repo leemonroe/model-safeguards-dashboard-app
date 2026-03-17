@@ -146,7 +146,18 @@ function computeModel(p) {
 
 function findRelevanceYear(data, budget) {
   for (let i = 0; i < data.length; i++) {
-    if (data[i].costAttack <= budget) return i;
+    if (data[i].costAttack <= budget) {
+      // Interpolate between previous year and this year for fractional precision
+      if (i === 0) return 0;
+      const prevCost = data[i - 1].costAttack;
+      const curCost = data[i].costAttack;
+      // Log-interpolate since costs are exponential
+      const logPrev = Math.log(prevCost);
+      const logCur = Math.log(curCost);
+      const logBudget = Math.log(budget);
+      const frac = (logPrev - logBudget) / (logPrev - logCur);
+      return (i - 1) + Math.max(0, Math.min(1, frac));
+    }
   }
   return data.length;
 }
@@ -201,6 +212,7 @@ function fastRelevanceYear(p, budget) {
   const computeScale = p.nThreshold / REFERENCE_PARAMS;
   const scaledCPK = p.computePer1K * computeScale;
   let cumAlgo = 1, cumAttack = 1;
+  let prevCost = Infinity;
   for (let t = 0; t <= 25; t++) {
     const hwF = t === 0 ? 1 : 1 + (headroom - 1) * (1 - Math.exp(-t / tau));
     if (t > 0) {
@@ -211,7 +223,16 @@ function fastRelevanceYear(p, budget) {
     const costTrain = p.costTrainBase / (hwF * cumAlgo);
     const computeRemove = (scaledCPK * effectiveSteps / 1000) / (hwF * cumAlgo);
     const costRemove = (p.setupCost + computeRemove) / cumAttack;
-    if (Math.min(costRemove, costTrain) <= budget) return t;
+    const costAttack = Math.min(costRemove, costTrain);
+    if (costAttack <= budget) {
+      if (t === 0) return 0;
+      const logPrev = Math.log(prevCost);
+      const logCur = Math.log(costAttack);
+      const logBudget = Math.log(budget);
+      const frac = (logPrev - logBudget) / (logPrev - logCur);
+      return (t - 1) + Math.max(0, Math.min(1, frac));
+    }
+    prevCost = costAttack;
   }
   return 26;
 }
@@ -234,10 +255,11 @@ function analyzeResults(results) {
   const pctl = (f) => yrs[Math.min(Math.floor(f * n), n - 1)];
   const percentiles = { p5: pctl(0.05), p10: pctl(0.1), p25: pctl(0.25), p50: pctl(0.5), p75: pctl(0.75), p90: pctl(0.9), p95: pctl(0.95) };
 
-  // Histogram
+  // Histogram (bin fractional years by floor)
   const hist = [];
   for (let y = 0; y <= 26; y++) {
-    hist.push({ year: y >= 26 ? ">25" : `${y}`, count: yrs.filter(v => v === y).length, pct: +(yrs.filter(v => v === y).length / n * 100).toFixed(1) });
+    const count = yrs.filter(v => y >= 26 ? v >= 26 : Math.floor(v) === y).length;
+    hist.push({ year: y >= 26 ? ">25" : `${y}`, count, pct: +(count / n * 100).toFixed(1) });
   }
 
   // Variance decomposition (split-halves approximation of first-order Sobol)
@@ -481,7 +503,7 @@ export default function App() {
     const row = { tr: `${x}×`, trNum: x };
     for (let y = 0; y <= HEAT_MAX_YR; y++) {
       const label = y === HEAT_MAX_YR ? `${y}+` : `${y}`;
-      row[label] = +((gains.filter(g => y === HEAT_MAX_YR ? g >= y : g === y).length / n) * 100).toFixed(1);
+      row[label] = +((gains.filter(g => y === HEAT_MAX_YR ? g >= y : Math.floor(g) === y).length / n) * 100).toFixed(1);
       row[`gte_${y}`] = +((gains.filter(g => g >= y).length / n) * 100).toFixed(1);
     }
     row.mean = +(gains.reduce((a, b) => a + b, 0) / n).toFixed(1);
@@ -627,7 +649,7 @@ export default function App() {
 
           {/* Metrics */}
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 4, alignItems: "stretch" }}>
-            <Metric label="Safeguard relevant for" value={selectedWindow >= 25 ? ">25yr" : `${selectedWindow}yr`}
+            <Metric label="Safeguard relevant for" value={selectedWindow >= 25 ? ">25yr" : `${selectedWindow.toFixed(1)}yr`}
               sub={`vs ${ACTORS[actorIdx].label}`} color={C.green} />
             <div style={{
               background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6,
@@ -664,7 +686,7 @@ export default function App() {
                 <Legend wrapperStyle={{ fontSize: 10, fontFamily: "var(--f)" }} />
                 <Line type="monotone" dataKey="costTrain" name="Train from scratch" stroke={C.train} strokeWidth={2.5} dot={false} />
                 <Line type="monotone" dataKey="costRemove" name="Remove safeguard" stroke={C.remove} strokeWidth={2.5} dot={false} />
-                <Line type="monotone" dataKey="costAttack" name="Min attack cost" stroke={C.attack} strokeWidth={2} strokeDasharray="6 3" dot={false} />
+                <Line type="monotone" dataKey="costAttack" name="Cheapest attack (fine-tune or retrain)" stroke={C.attack} strokeWidth={2} strokeDasharray="6 3" dot={false} />
                 <ReferenceLine y={hwFloor} stroke={C.hw} strokeDasharray="2 4" strokeWidth={1}
                   label={{ value: "Hardware floor", position: "right", style: { fontSize: 9, fill: C.hw } }} />
                 <ReferenceLine y={budget} stroke={C.red} strokeDasharray="4 4" strokeWidth={1.5}
@@ -773,7 +795,7 @@ export default function App() {
                   <div key={idx} style={{ marginBottom: 18 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
                       <span style={{ fontSize: 11, color: col, fontWeight: 600 }}>{w.label}</span>
-                      <span style={{ fontSize: 10, color: C.muted }}>{w.years >= 25 ? ">25yr" : `${w.years}yr`}</span>
+                      <span style={{ fontSize: 10, color: C.muted }}>{w.years >= 25 ? ">25yr" : `${w.years.toFixed(1)}yr`}</span>
                     </div>
                     <div style={{ background: C.border, borderRadius: 3, height: 20, position: "relative", overflow: "hidden" }}>
                       <div style={{
