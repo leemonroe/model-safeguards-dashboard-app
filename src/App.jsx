@@ -109,9 +109,11 @@ function computeModel(p) {
     const trMultiplier = effectiveSteps / BASELINE_STEPS;
 
     // ── Cost to remove safeguard ──
-    // Compute scales with steps and O(N) with model size; setup is fixed
-    const computeRemove = (p.computePer1K * effectiveSteps / 1000) / cumFtReduction;
-    const costRemove = (p.setupCost + computeRemove) / cumAttack;
+    // Attack improvement reduces effective steps needed; hw/algo reduce cost per step
+    // Setup cost is fixed (data, expertise) — not affected by attack methods
+    const effectiveStepsAtT = effectiveSteps / cumAttack;
+    const computeRemove = (p.computePer1K * effectiveStepsAtT / 1000) / cumFtReduction;
+    const costRemove = p.setupCost + computeRemove;
 
     // ── Derived ──
     const costAttack = Math.min(costRemove, costTrain);
@@ -212,8 +214,9 @@ function fastRelevanceYear(p, budget) {
       cumAttack *= 1 + (p.attackRate - 1) * ad;
     }
     const costTrain = p.costTrainBase / (hwF * cumAlgo);
-    const computeRemove = (p.computePer1K * effectiveSteps / 1000) / (hwF * cumAlgo);
-    const costRemove = (p.setupCost + computeRemove) / cumAttack;
+    const effectiveStepsAtT = effectiveSteps / cumAttack;
+    const computeRemove = (p.computePer1K * effectiveStepsAtT / 1000) / (hwF * cumAlgo);
+    const costRemove = p.setupCost + computeRemove;
     const costAttack = Math.min(costRemove, costTrain);
     if (costAttack <= budget) {
       if (t === 0) return 0;
@@ -575,7 +578,7 @@ export default function App() {
 
           <GroupLabel color={C.hw}>Hardware (Has a Ceiling)</GroupLabel>
           <Slider label="Improvement rate (×/yr)" value={hwRate} onChange={setHwRate}
-            min={1.05} max={2.5} step={0.05} format={v => `${v.toFixed(2)}×`} color={C.hw}
+            min={1} max={2.5} step={0.05} format={v => `${v.toFixed(2)}×`} color={C.hw}
             tip="Current annual hardware price-performance gain. Epoch AI data: GPU FLOP/$ doubles every ~2.5yr ≈ 1.32×/yr. Including specialization (lower precision, tensor cores): ~1.4×/yr." />
           <Slider label="Years until plateau" value={yearsToPlateauHw} onChange={setYearsToPlateauHw}
             min={3} max={25} step={1} format={v => `${v}yr`} color={C.hw}
