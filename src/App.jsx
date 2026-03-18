@@ -40,10 +40,6 @@ const logFrac = (min, max, v) => (Math.log10(Math.max(v, min)) - Math.log10(min)
 // Baseline fine-tuning steps (unprotected model). Fixed internal constant.
 const BASELINE_STEPS = 100;
 
-// Reference model size for compute cost slider. computePer1K is "at this size",
-// then scales O(N) with nThreshold.
-const REFERENCE_PARAMS = 70e9;
-
 // Derive internal parameters from user-facing ones
 function deriveInternal(p) {
   // Hardware: user provides rate (×/yr) and years-to-plateau
@@ -56,24 +52,21 @@ function deriveInternal(p) {
   // TR alpha: user provides "10× larger model is X× harder to break"
   // R(N) = base * (N/1B)^alpha => R(10N)/R(N) = 10^alpha = trScaling10x
   // => alpha = log10(trScaling10x);
-  const alpha = Math.log10(p.trScaling10x);
+  const alpha = Math.log10(Math.max(p.trScaling10x, 1.001));
 
-  // Compute cost scales O(N) with model size relative to 70B reference
-  const computeScale = p.nThreshold / REFERENCE_PARAMS;
-  const scaledComputePer1K = p.computePer1K * computeScale;
-
-  // Derive costFtBase and trBase from new user-facing params:
+  // computePer1K is directly at threshold model size — no reference scaling needed
+  // Derive costFtBase and trBase from user-facing params:
   //   setupCost = fixed overhead (data, expertise) — TR doesn't affect
-  //   scaledComputePer1K = GPU cost per 1K steps at actual model size
+  //   computePer1K = GPU cost per 1K steps at threshold model size
   //   stepsToCircumvent = steps needed to break the safeguard
-  const costFtBase = p.setupCost + scaledComputePer1K * BASELINE_STEPS / 1000;
+  const costFtBase = p.setupCost + p.computePer1K * BASELINE_STEPS / 1000;
   const trBase = p.stepsToCircumvent / BASELINE_STEPS;
 
-  return { tau, headroom, alpha, costFtBase, trBase, computeScale, scaledComputePer1K };
+  return { tau, headroom, alpha, costFtBase, trBase };
 }
 
 function computeModel(p) {
-  const { tau, headroom, alpha, costFtBase, trBase, scaledComputePer1K } = deriveInternal(p);
+  const { tau, headroom, alpha, costFtBase, trBase } = deriveInternal(p);
   const data = [];
   const YEARS = 25;
 
@@ -98,7 +91,7 @@ function computeModel(p) {
     // Only the compute portion declines; setup cost stays fixed
     // Compute cost scales O(N) with model size
     const cumFtReduction = hwFactor * cumAlgo;
-    const computeBase = scaledComputePer1K * BASELINE_STEPS / 1000;
+    const computeBase = p.computePer1K * BASELINE_STEPS / 1000;
     const costFtRaw = p.setupCost + computeBase / cumFtReduction;
 
     // ── Attack improvement: decelerates on same timeline as algo ──
@@ -117,7 +110,7 @@ function computeModel(p) {
 
     // ── Cost to remove safeguard ──
     // Compute scales with steps and O(N) with model size; setup is fixed
-    const computeRemove = (scaledComputePer1K * effectiveSteps / 1000) / cumFtReduction;
+    const computeRemove = (p.computePer1K * effectiveSteps / 1000) / cumFtReduction;
     const costRemove = (p.setupCost + computeRemove) / cumAttack;
 
     // ── Derived ──
@@ -169,8 +162,8 @@ const PARAM_RANGES = [
     src: "GPT-4 ~$100M; frontier 2025 ~$500M-$2B; smaller capable models much less" },
   { key: "setupCost", label: "Attack setup cost", lo: 2e3, hi: 2e4, log: true,
     src: "Data sourcing, expertise, infrastructure setup. Range $2K-$20K reflects realistic attack preparation costs. Slider allows wider exploration." },
-  { key: "computePer1K", label: "Compute per 1K steps (at 70B)", lo: 20, hi: 500, log: true,
-    src: "Assumes full fine-tuning ($20-$500/1K at 70B). Conservative: excludes QLoRA ($0.50-$5) because we want safeguard-optimistic estimates. If QLoRA suffices to break TR, real costs are much lower." },
+  { key: "computePer1K", label: "Compute per 1K steps (at threshold)", lo: 20, hi: 500, log: true,
+    src: "Assumes full fine-tuning at threshold model size. Conservative: excludes QLoRA ($0.50-$5) because we want safeguard-optimistic estimates. If QLoRA suffices to break TR, real costs are much lower." },
   { key: "hwRate", label: "Hardware improvement rate", lo: 1.1, hi: 1.55, log: false,
     src: "Centered on Epoch AI estimate: GPU FLOP/$ doubles every ~2.5yr (1.32×/yr). Range reflects uncertainty around this estimate, not speculative extremes." },
   { key: "yearsToPlateauHw", label: "Years until hardware plateaus", lo: 5, hi: 15, log: false,
@@ -209,8 +202,6 @@ function fastRelevanceYear(p, budget) {
   const alpha = Math.log10(Math.max(p.trScaling10x, 1.001));
   const sizeScaling = Math.pow(p.nThreshold / 1e9, alpha);
   const effectiveSteps = p.stepsToCircumvent * sizeScaling;
-  const computeScale = p.nThreshold / REFERENCE_PARAMS;
-  const scaledCPK = p.computePer1K * computeScale;
   let cumAlgo = 1, cumAttack = 1;
   let prevCost = Infinity;
   for (let t = 0; t <= 25; t++) {
@@ -221,7 +212,7 @@ function fastRelevanceYear(p, budget) {
       cumAttack *= 1 + (p.attackRate - 1) * ad;
     }
     const costTrain = p.costTrainBase / (hwF * cumAlgo);
-    const computeRemove = (scaledCPK * effectiveSteps / 1000) / (hwF * cumAlgo);
+    const computeRemove = (p.computePer1K * effectiveSteps / 1000) / (hwF * cumAlgo);
     const costRemove = (p.setupCost + computeRemove) / cumAttack;
     const costAttack = Math.min(costRemove, costTrain);
     if (costAttack <= budget) {
@@ -450,9 +441,11 @@ export default function App() {
 
   const data = useMemo(() => computeModel(p), [p]);
   const derived = useMemo(() => deriveInternal(p), [p]);
-  const { headroom, costFtBase, trBase, scaledComputePer1K } = derived;
+  const { headroom, costFtBase, trBase, alpha: trAlpha } = derived;
   const hwFloor = costTrainBase / headroom;
-  const costToCircumventToday = setupCost + scaledComputePer1K * stepsToCircumvent / 1000;
+  const sizeScaling = Math.pow(nThreshold / 1e9, trAlpha);
+  const effectiveStepsToday = stepsToCircumvent * sizeScaling;
+  const costToCircumventToday = setupCost + computePer1K * effectiveStepsToday / 1000;
 
   // Relevance windows for all preset actors
   const windows = useMemo(() => allBudgets.map(a => ({
@@ -576,9 +569,9 @@ export default function App() {
           <Slider label="Attack setup cost (data, expertise)" value={setupCost} onChange={setSetupCost}
             min={100} max={1e6} log format={fmt} color={C.train}
             tip="Fixed overhead for an attack: sourcing training data, infrastructure setup, expertise. Not affected by tamper resistance — the attacker pays this regardless." />
-          <Slider label="Compute cost per 1K steps (at 70B)" value={computePer1K} onChange={setComputePer1K}
+          <Slider label={`Compute cost per 1K steps (at ${fmtParams(nThreshold)})`} value={computePer1K} onChange={setComputePer1K}
             min={0.1} max={1e3} log format={fmt} color={C.train}
-            tip="GPU cost per 1K fine-tuning steps at 70B params. Scales O(N) with model size. Default $5 reflects QLoRA — the cheapest realistic attack: ~$0.50-$1 for QLoRA, ~$5-$50 for LoRA, ~$50-$500 for full fine-tune. We default to QLoRA-range because a rational attacker uses the cheapest method that works." />
+            tip={`GPU cost per 1K fine-tuning steps at ${fmtParams(nThreshold)} params. Scales O(N) with model size. At 70B: ~$0.50-$1 for QLoRA, ~$5-$50 for LoRA, ~$50-$500 for full fine-tune.`} />
 
           <GroupLabel color={C.hw}>Hardware (Has a Ceiling)</GroupLabel>
           <Slider label="Improvement rate (×/yr)" value={hwRate} onChange={setHwRate}
@@ -615,7 +608,7 @@ export default function App() {
               {fmt(costToCircumventToday)}
             </div>
             <div style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>
-              {fmt(setupCost)} setup + {fmt(scaledComputePer1K * stepsToCircumvent / 1000)} compute ({stepsToCircumvent.toLocaleString()} steps × {fmt(scaledComputePer1K)}/1K at {fmtParams(nThreshold)})
+              {fmt(setupCost)} setup + {fmt(computePer1K * effectiveStepsToday / 1000)} compute ({Math.round(effectiveStepsToday).toLocaleString()} effective steps × {fmt(computePer1K)}/1K)
             </div>
           </div>
           <Slider label="10× bigger model → ___× harder" value={trScaling10x} onChange={setTrScaling10x}
@@ -836,7 +829,7 @@ export default function App() {
           {/* ── Required TR ── */}
           {tab === "requiredTR" && (() => {
             // Compute required TR for each year and each actor
-            const { headroom: hd, alpha: al, scaledComputePer1K: scaledCPK } = deriveInternal(p);
+            const { headroom: hd, alpha: al } = deriveInternal(p);
             const reqData = [];
             for (let t = 0; t <= 25; t++) {
               const tau = p.yearsToPlateauHw / 3;
@@ -848,7 +841,7 @@ export default function App() {
                 cumAttack *= 1 + (p.attackRate - 1) * ad;
               }
               const costTrainT = p.costTrainBase / (hwF * cumAlgo);
-              const computeBaseT = (scaledCPK * BASELINE_STEPS / 1000) / (hwF * cumAlgo);
+              const computeBaseT = (p.computePer1K * BASELINE_STEPS / 1000) / (hwF * cumAlgo);
               const costFtT = p.setupCost + computeBaseT;
               const trCeiling = costTrainT / costFtT * cumAttack;
 
@@ -1328,9 +1321,9 @@ export default function App() {
                 { c: C.combined, t: "Combined Training Cost",
                   eq: "Cost_train(t) = base / (hw_factor(t) × Π algo_rate(i))" },
                 { c: C.remove, t: "Cost to Remove Safeguard",
-                  eq: `Cost_remove(t) = setup + (compute_per_1K × N/70B × eff_steps / 1000) / decline(t) / attack_improvement(t)\n\nCompute per 1K steps: ${fmt(computePer1K)} at 70B → ${fmt(scaledComputePer1K)} at ${fmtParams(nThreshold)} (O(N) scaling)\nEffective steps = ${stepsToCircumvent.toLocaleString()} × (N / 1B)^${Math.log10(trScaling10x).toFixed(3)}\n               = ${(stepsToCircumvent * Math.pow(nThreshold / 1e9, Math.log10(trScaling10x))).toFixed(0)} at ${fmtParams(nThreshold)} params\nCost today = ${fmt(costToCircumventToday)}\n\nAttack methods decelerate on same halflife as algo.` },
+                  eq: `Cost_remove(t) = setup + (compute_per_1K × eff_steps / 1000) / decline(t) / attack_improvement(t)\n\nCompute per 1K steps: ${fmt(computePer1K)} at ${fmtParams(nThreshold)}\nEffective steps = ${stepsToCircumvent.toLocaleString()} × (N / 1B)^${Math.log10(trScaling10x).toFixed(3)}\n               = ${(stepsToCircumvent * Math.pow(nThreshold / 1e9, Math.log10(trScaling10x))).toFixed(0)} at ${fmtParams(nThreshold)} params\nCost today = ${fmt(costToCircumventToday)}\n\nAttack methods decelerate on same halflife as algo.` },
                 { c: C.remove, t: "Compute Cost Scaling (O(N))",
-                  eq: `Fine-tuning cost per step scales linearly with model parameter count.\nThis follows from the forward + backward pass being O(N) in parameters.\n\nA 7B model costs ~10× less per step than 70B.\nA 700B model costs ~10× more per step than 70B.\n\nWe assume the attacker uses the cheapest effective method (QLoRA),\nwhich at 70B costs ~$0.50-$1/1K steps. LoRA: ~$5-$50/1K. Full FT: ~$50-$500/1K.\nDefault (${fmt(computePer1K)}/1K at 70B) is conservative — assumes cheapest viable attack.` },
+                  eq: `Fine-tuning cost per step scales linearly with model parameter count.\nThis follows from the forward + backward pass being O(N) in parameters.\n\nCompute cost per 1K steps is specified directly at the threshold model size (${fmtParams(nThreshold)}).\nAt 70B: ~$0.50-$1/1K for QLoRA, ~$5-$50/1K for LoRA, ~$50-$500/1K for full FT.\nCurrent setting: ${fmt(computePer1K)}/1K at ${fmtParams(nThreshold)}.` },
                 { c: C.green, t: "Tamper Resistance Ceiling",
                   eq: "Max_useful_TR = Cost_train / Cost_ft × attack_improvement\n\nBeyond this, attacker trains from scratch.\nAdditional TR investment is wasted." },
               ].map(({ c, t, eq }, i) => (
@@ -1412,7 +1405,7 @@ export default function App() {
                 ],
               },
               {
-                param: "Compute cost per 1K steps (at 70B)",
+                param: "Compute cost per 1K steps (at threshold)",
                 range: "$20 – $500",
                 confidence: "medium-high",
                 lo: "$20 — 8×H100 at $2/hr spot pricing, ~20 steps/min throughput. 1K steps ≈ 50 min ≈ $13-27. Efficient setups with spot pricing.",
