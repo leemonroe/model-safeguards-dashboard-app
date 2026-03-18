@@ -416,7 +416,7 @@ export default function App() {
   // Core parameters
   const [costTrainBase, setCostTrainBase] = useState(5e8);
   const [setupCost, setSetupCost] = useState(5e3);
-  const [computePer1K, setComputePer1K] = useState(5);
+  const [computePer1K, setComputePer1K] = useState(100);
   const [hwRate, setHwRate] = useState(1.4);
   const [yearsToPlateauHw, setYearsToPlateauHw] = useState(10);
   const [algoRate, setAlgoRate] = useState(2.5);
@@ -571,7 +571,7 @@ export default function App() {
             tip="Fixed overhead for an attack: sourcing training data, infrastructure setup, expertise. Not affected by tamper resistance — the attacker pays this regardless." />
           <Slider label={`Compute cost per 1K steps (at ${fmtParams(nThreshold)})`} value={computePer1K} onChange={setComputePer1K}
             min={0.1} max={1e3} log format={fmt} color={C.train}
-            tip={`GPU cost per 1K fine-tuning steps at ${fmtParams(nThreshold)} params. Scales O(N) with model size. At 70B: ~$0.50-$1 for QLoRA, ~$5-$50 for LoRA, ~$50-$500 for full fine-tune.`} />
+            tip={`GPU cost per 1K full fine-tuning steps at ${fmtParams(nThreshold)} params. Default assumes full fine-tune (safeguard-optimistic: TR may defeat parameter-efficient methods). At 70B: ~$50-$500 for full FT, ~$5-$50 for LoRA, ~$0.50-$5 for QLoRA.`} />
 
           <GroupLabel color={C.hw}>Hardware (Has a Ceiling)</GroupLabel>
           <Slider label="Improvement rate (×/yr)" value={hwRate} onChange={setHwRate}
