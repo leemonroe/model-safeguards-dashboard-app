@@ -54,12 +54,10 @@ function deriveInternal(p) {
   // => alpha = log10(trScaling10x);
   const alpha = Math.log10(Math.max(p.trScaling10x, 1.001));
 
-  // computePer1K is directly at threshold model size — no reference scaling needed
   // Derive costFtBase and trBase from user-facing params:
-  //   setupCost = fixed overhead (data, expertise) — TR doesn't affect
   //   computePer1K = GPU cost per 1K steps at threshold model size
   //   stepsToCircumvent = steps needed to break the safeguard
-  const costFtBase = p.setupCost + p.computePer1K * BASELINE_STEPS / 1000;
+  const costFtBase = p.computePer1K * BASELINE_STEPS / 1000;
   const trBase = p.stepsToCircumvent / BASELINE_STEPS;
 
   return { tau, headroom, alpha, costFtBase, trBase };
@@ -87,20 +85,10 @@ function computeModel(p) {
     const costTrain = p.costTrainBase / cumTrainReduction;
     const costTrainHwOnly = p.costTrainBase / hwFactor;
 
-    // ── Fine-tuning: benefits from same hw + algo (simplified) ──
-    // Only the compute portion declines; setup cost stays fixed
-    // Compute cost scales O(N) with model size
+    // ── Fine-tuning: benefits from same hw + algo ──
     const cumFtReduction = hwFactor * cumAlgo;
     const computeBase = p.computePer1K * BASELINE_STEPS / 1000;
-    const costFtRaw = p.setupCost + computeBase / cumFtReduction;
-
-    // ── Attack improvement: decelerates on same timeline as algo ──
-    let cumAttack = 1;
-    for (let i = 1; i <= t; i++) {
-      const decay = Math.pow(0.5, i / p.algoHalflife);
-      const rate = 1 + (p.attackRate - 1) * decay;
-      cumAttack *= rate;
-    }
+    const costFtRaw = computeBase / cumFtReduction;
 
     // ── Tamper resistance ──
     // Effective steps = user steps × model size scaling
@@ -109,15 +97,13 @@ function computeModel(p) {
     const trMultiplier = effectiveSteps / BASELINE_STEPS;
 
     // ── Cost to remove safeguard ──
-    // Attack improvement reduces effective steps needed; hw/algo reduce cost per step
-    // Setup cost is fixed (data, expertise) — not affected by attack methods
-    const effectiveStepsAtT = effectiveSteps / cumAttack;
-    const computeRemove = (p.computePer1K * effectiveStepsAtT / 1000) / cumFtReduction;
-    const costRemove = p.setupCost + computeRemove;
+    // hw/algo reduce cost per step; TR determines number of steps
+    const computeRemove = (p.computePer1K * effectiveSteps / 1000) / cumFtReduction;
+    const costRemove = computeRemove;
 
     // ── Derived ──
     const costAttack = Math.min(costRemove, costTrain);
-    const maxUsefulTR = costTrain / costFtRaw * cumAttack;
+    const maxUsefulTR = costTrain / costFtRaw;
 
     // Effective annual rates for decomposition
     let effHwRate = 1;
@@ -162,8 +148,6 @@ function findRelevanceYear(data, budget) {
 const PARAM_RANGES = [
   { key: "costTrainBase", label: "Training cost today", lo: 1e7, hi: 5e10, log: true,
     src: "GPT-4 ~$100M; frontier 2025 ~$500M-$2B; smaller capable models much less" },
-  { key: "setupCost", label: "Attack setup cost", lo: 2e3, hi: 2e4, log: true,
-    src: "Data sourcing, expertise, infrastructure setup. Range $2K-$20K reflects realistic attack preparation costs. Slider allows wider exploration." },
   { key: "computePer1K", label: "Compute per 1K steps (at threshold)", lo: 20, hi: 500, log: true,
     src: "Assumes full fine-tuning at threshold model size. Conservative: excludes QLoRA ($0.50-$5) because we want safeguard-optimistic estimates. If QLoRA suffices to break TR, real costs are much lower." },
   { key: "hwRate", label: "Hardware improvement rate", lo: 1.1, hi: 1.55, log: false,
@@ -174,8 +158,6 @@ const PARAM_RANGES = [
     src: "Centered on Epoch AI controlled estimate (~3×/yr). Lower end allows for deceleration from current pace; upper end for continued rapid discovery." },
   { key: "algoHalflife", label: "Years of fast algo progress", lo: 3, hi: 20, log: false,
     src: "Catch-up from transformers may stall fast (3yr). AI-driven R&D could sustain 15-20yr." },
-  { key: "attackRate", label: "Attack method improvement", lo: 1.0, hi: 2.5, log: false,
-    src: "Poorly measured — no Epoch-quality estimates exist. Capped at 2.5× for safeguard-optimistic analysis. Real rate is highly uncertain." },
   { key: "stepsToCircumvent", label: "Steps to circumvent safeguard", lo: 100, hi: 1e8, log: true,
     src: "No known upper bound on achievable TR. Upper bound set where removal cost approaches training cost (the natural ceiling). Samples above this enter training-limited regime automatically." },
   { key: "trScaling10x", label: "TR scaling (10× larger model)", lo: 1.0, hi: 5.0, log: false,
@@ -204,19 +186,17 @@ function fastRelevanceYear(p, budget) {
   const alpha = Math.log10(Math.max(p.trScaling10x, 1.001));
   const sizeScaling = Math.pow(p.nThreshold / 1e9, alpha);
   const effectiveSteps = p.stepsToCircumvent * sizeScaling;
-  let cumAlgo = 1, cumAttack = 1;
+  let cumAlgo = 1;
   let prevCost = Infinity;
   for (let t = 0; t <= 25; t++) {
     const hwF = t === 0 ? 1 : 1 + (headroom - 1) * (1 - Math.exp(-t / tau));
     if (t > 0) {
       const ad = Math.pow(0.5, t / p.algoHalflife);
       cumAlgo *= 1 + (p.algoRate - 1) * ad;
-      cumAttack *= 1 + (p.attackRate - 1) * ad;
     }
     const costTrain = p.costTrainBase / (hwF * cumAlgo);
-    const effectiveStepsAtT = effectiveSteps / cumAttack;
-    const computeRemove = (p.computePer1K * effectiveStepsAtT / 1000) / (hwF * cumAlgo);
-    const costRemove = p.setupCost + computeRemove;
+    const computeRemove = (p.computePer1K * effectiveSteps / 1000) / (hwF * cumAlgo);
+    const costRemove = computeRemove;
     const costAttack = Math.min(costRemove, costTrain);
     if (costAttack <= budget) {
       if (t === 0) return 0;
@@ -418,13 +398,11 @@ export default function App() {
 
   // Core parameters
   const [costTrainBase, setCostTrainBase] = useState(5e8);
-  const [setupCost, setSetupCost] = useState(5e3);
   const [computePer1K, setComputePer1K] = useState(100);
   const [hwRate, setHwRate] = useState(1.4);
   const [yearsToPlateauHw, setYearsToPlateauHw] = useState(10);
   const [algoRate, setAlgoRate] = useState(2.5);
   const [algoHalflife, setAlgoHalflife] = useState(8);
-  const [attackRate, setAttackRate] = useState(2.0);
   const [stepsToCircumvent, setStepsToCircumvent] = useState(10000);
   const [trScaling10x, setTrScaling10x] = useState(2.0);
   const [nThreshold, setNThreshold] = useState(7e10);
@@ -437,10 +415,10 @@ export default function App() {
   const allBudgets = useMemo(() => ACTORS.filter(a => a.budget !== null).map(a => a), []);
 
   const p = useMemo(() => ({
-    costTrainBase, setupCost, computePer1K, hwRate, yearsToPlateauHw,
-    algoRate, algoHalflife, attackRate,
+    costTrainBase, computePer1K, hwRate, yearsToPlateauHw,
+    algoRate, algoHalflife,
     stepsToCircumvent, trScaling10x, nThreshold,
-  }), [costTrainBase, setupCost, computePer1K, hwRate, yearsToPlateauHw, algoRate, algoHalflife, attackRate, stepsToCircumvent, trScaling10x, nThreshold]);
+  }), [costTrainBase, computePer1K, hwRate, yearsToPlateauHw, algoRate, algoHalflife, stepsToCircumvent, trScaling10x, nThreshold]);
 
   const data = useMemo(() => computeModel(p), [p]);
   const derived = useMemo(() => deriveInternal(p), [p]);
@@ -448,7 +426,7 @@ export default function App() {
   const hwFloor = costTrainBase / headroom;
   const sizeScaling = Math.pow(nThreshold / 1e9, trAlpha);
   const effectiveStepsToday = stepsToCircumvent * sizeScaling;
-  const costToCircumventToday = setupCost + computePer1K * effectiveStepsToday / 1000;
+  const costToCircumventToday = computePer1K * effectiveStepsToday / 1000;
 
   // Relevance windows for all preset actors
   const windows = useMemo(() => allBudgets.map(a => ({
@@ -569,9 +547,6 @@ export default function App() {
           <Slider label="Training cost today" value={costTrainBase} onChange={setCostTrainBase}
             min={1e6} max={1e11} log format={fmt} color={C.train}
             tip="Current dollar cost to train a model at the capability threshold from scratch. GPT-4 scale ≈ $100M; frontier 2025 ≈ $500M-$1B." />
-          <Slider label="Attack setup cost (data, expertise)" value={setupCost} onChange={setSetupCost}
-            min={100} max={1e6} log format={fmt} color={C.train}
-            tip="Fixed overhead for an attack: sourcing training data, infrastructure setup, expertise. Not affected by tamper resistance — the attacker pays this regardless." />
           <Slider label={`Compute cost per 1K steps (at ${fmtParams(nThreshold)})`} value={computePer1K} onChange={setComputePer1K}
             min={0.1} max={1e3} log format={fmt} color={C.train}
             tip={`GPU cost per 1K full fine-tuning steps at ${fmtParams(nThreshold)} params. Default assumes full fine-tune (safeguard-optimistic: TR may defeat parameter-efficient methods). At 70B: ~$50-$500 for full FT, ~$5-$50 for LoRA, ~$0.50-$5 for QLoRA.`} />
@@ -592,10 +567,7 @@ export default function App() {
             min={2} max={25} step={1} format={v => `${v}yr`} color={C.algo}
             tip="How long algorithmic improvement stays near its current pace before noticeably slowing. After this many years, the rate has dropped to roughly half its starting value. Longer = sustained progress." />
 
-          <GroupLabel color={C.remove}>Attacks & Tamper Resistance</GroupLabel>
-          <Slider label="Attack improvement (×/yr)" value={attackRate} onChange={setAttackRate}
-            min={1} max={5} step={0.1} format={v => `${v.toFixed(1)}×`} color={C.remove}
-            tip="Annual improvement in adversarial fine-tuning methods for removing safeguards (LoRA optimization, loss design, etc). Decelerates on the same timeline as algorithmic progress." />
+          <GroupLabel color={C.remove}>Tamper Resistance</GroupLabel>
           <Slider label="Steps to circumvent safeguard" value={stepsToCircumvent} onChange={setStepsToCircumvent}
             min={10} max={1e7} log format={v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1000 ? `${(v/1000).toFixed(0)}K` : `${v.toFixed(0)}`} color={C.green}
             tip="Fine-tuning steps needed to break the safeguard. Reference points: No safeguard ~100 steps. Post-training safety tuning ~50-200. TAR (Tamirisa et al.) ~1K-5K. Deep Ignorance (EleutherAI) ~10K. This is what TR papers actually measure." />
@@ -611,7 +583,7 @@ export default function App() {
               {fmt(costToCircumventToday)}
             </div>
             <div style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>
-              {fmt(setupCost)} setup + {fmt(computePer1K * effectiveStepsToday / 1000)} compute ({Math.round(effectiveStepsToday).toLocaleString()} effective steps × {fmt(computePer1K)}/1K)
+              {Math.round(effectiveStepsToday).toLocaleString()} effective steps × {fmt(computePer1K)}/1K
             </div>
           </div>
           <Slider label="10× bigger model → ___× harder" value={trScaling10x} onChange={setTrScaling10x}
@@ -837,16 +809,15 @@ export default function App() {
             for (let t = 0; t <= 25; t++) {
               const tau = p.yearsToPlateauHw / 3;
               const hwF = t === 0 ? 1 : 1 + (hd - 1) * (1 - Math.exp(-t / tau));
-              let cumAlgo = 1, cumAttack = 1;
+              let cumAlgo = 1;
               for (let i = 1; i <= t; i++) {
                 const ad = Math.pow(0.5, i / p.algoHalflife);
                 cumAlgo *= 1 + (p.algoRate - 1) * ad;
-                cumAttack *= 1 + (p.attackRate - 1) * ad;
               }
               const costTrainT = p.costTrainBase / (hwF * cumAlgo);
               const computeBaseT = (p.computePer1K * BASELINE_STEPS / 1000) / (hwF * cumAlgo);
-              const costFtT = p.setupCost + computeBaseT;
-              const trCeiling = costTrainT / costFtT * cumAttack;
+              const costFtT = computeBaseT;
+              const trCeiling = costTrainT / costFtT;
 
               const row = { year: 2026 + t, t, trCeiling, costTrainT };
               ACTORS.filter(a => a.budget !== null).forEach(a => {
@@ -854,7 +825,7 @@ export default function App() {
                   row[`tr_${a.label}`] = null; // impossible
                   row[`impossible_${a.label}`] = true;
                 } else {
-                  row[`tr_${a.label}`] = a.budget * cumAttack / costFtT;
+                  row[`tr_${a.label}`] = a.budget / costFtT;
                   row[`impossible_${a.label}`] = false;
                 }
               });
@@ -982,7 +953,7 @@ export default function App() {
               <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20, fontSize: 11, color: C.muted, lineHeight: 1.8 }}>
                 <p style={{ margin: "0 0 10px" }}>
                   <span style={{ color: C.text, fontWeight: 600 }}>Required TR grows exponentially.</span>{" "}
-                  Because both base attack costs fall and attack methods improve each year, the tamper resistance needed to maintain relevance compounds. Linear or slowly-growing TR is overwhelmed within 1-2 years. Under the current parameters, TR must grow at roughly{" "}
+                  Because compute costs fall each year, the tamper resistance needed to maintain relevance compounds. Linear or slowly-growing TR is overwhelmed within 1-2 years. Under the current parameters, TR must grow at roughly{" "}
                   <span style={{ color: C.yellow, fontWeight: 600 }}>
                     {(() => {
                       const d5 = reqData[5];
@@ -1324,11 +1295,11 @@ export default function App() {
                 { c: C.combined, t: "Combined Training Cost",
                   eq: "Cost_train(t) = base / (hw_factor(t) × Π algo_rate(i))" },
                 { c: C.remove, t: "Cost to Remove Safeguard",
-                  eq: `Cost_remove(t) = setup + (compute_per_1K × eff_steps / 1000) / decline(t) / attack_improvement(t)\n\nCompute per 1K steps: ${fmt(computePer1K)} at ${fmtParams(nThreshold)}\nEffective steps = ${stepsToCircumvent.toLocaleString()} × (N / 1B)^${Math.log10(trScaling10x).toFixed(3)}\n               = ${(stepsToCircumvent * Math.pow(nThreshold / 1e9, Math.log10(trScaling10x))).toFixed(0)} at ${fmtParams(nThreshold)} params\nCost today = ${fmt(costToCircumventToday)}\n\nAttack methods decelerate on same halflife as algo.` },
+                  eq: `Cost_remove(t) = (compute_per_1K × eff_steps / 1000) / decline(t)\n\nCompute per 1K steps: ${fmt(computePer1K)} at ${fmtParams(nThreshold)}\nEffective steps = ${stepsToCircumvent.toLocaleString()} × (N / 1B)^${Math.log10(trScaling10x).toFixed(3)}\n               = ${(stepsToCircumvent * Math.pow(nThreshold / 1e9, Math.log10(trScaling10x))).toFixed(0)} at ${fmtParams(nThreshold)} params\nCost today = ${fmt(costToCircumventToday)}` },
                 { c: C.remove, t: "Compute Cost Scaling (O(N))",
                   eq: `Fine-tuning cost per step scales linearly with model parameter count.\nThis follows from the forward + backward pass being O(N) in parameters.\n\nCompute cost per 1K steps is specified directly at the threshold model size (${fmtParams(nThreshold)}).\nAt 70B: ~$0.50-$1/1K for QLoRA, ~$5-$50/1K for LoRA, ~$50-$500/1K for full FT.\nCurrent setting: ${fmt(computePer1K)}/1K at ${fmtParams(nThreshold)}.` },
                 { c: C.green, t: "Tamper Resistance Ceiling",
-                  eq: "Max_useful_TR = Cost_train / Cost_ft × attack_improvement\n\nBeyond this, attacker trains from scratch.\nAdditional TR investment is wasted." },
+                  eq: "Max_useful_TR = Cost_train / Cost_ft\n\nBeyond this, attacker trains from scratch.\nAdditional TR investment is wasted." },
               ].map(({ c, t, eq }, i) => (
                 <div key={i} style={{ marginBottom: 14 }}>
                   <div style={{ color: c, fontWeight: 600, marginBottom: 4, fontSize: 12 }}>{t}</div>
@@ -1395,19 +1366,6 @@ export default function App() {
                 ],
               },
               {
-                param: "Attack setup cost",
-                range: "$2K – $20K",
-                confidence: "low",
-                lo: "$2K represents a skilled individual spending ~1 week sourcing data + minimal cloud costs for experimentation.",
-                hi: "$20K includes comprehensive dataset curation ($1-5K), H100 cloud rental for experimentation ($2-10K), and specialized expertise ($5-10K).",
-                central: "$5K — no published work systematically breaks down adversarial fine-tuning preparation costs. This is an author estimate.",
-                sources: [
-                  "Qi et al., 'Fine-tuning Aligned Language Models Compromises Safety,' arXiv:2310.03693 (2023) — demonstrated trivial compute cost for the attack itself",
-                  "Yang et al., 'Shadow Alignment,' arXiv:2310.02949 (2023) — similar results on attack simplicity",
-                  "No systematic attack cost decomposition exists in the literature [GAP]",
-                ],
-              },
-              {
                 param: "Compute cost per 1K steps (at threshold)",
                 range: "$20 – $500",
                 confidence: "medium-high",
@@ -1470,20 +1428,6 @@ export default function App() {
                   "Bloom et al., 'Are Ideas Getting Harder to Find?' AER (2020) — empirical support for decelerating discovery rates",
                   "Cotra, 'Forecasting Transformative AI,' Open Philanthropy (2020) — discusses efficiency trends in long-run context",
                   "No direct empirical source for this parameter [STRUCTURAL ASSUMPTION]",
-                ],
-              },
-              {
-                param: "Attack method improvement",
-                range: "1.0× – 2.5×/yr",
-                confidence: "low",
-                lo: "1.0×/yr — adversarial fine-tuning methods stagnate; current methods (LoRA, full FT) are near-optimal.",
-                hi: "2.5×/yr — based on 2021-2024 timeline: LoRA (Jun 2021) → QLoRA (May 2023) → GaLore (Mar 2024), each reducing requirements by 2-10×. Capped at 2.5× for safeguard-optimistic analysis.",
-                central: "2.0×/yr — author estimate. No Epoch-quality analysis of adversarial method improvement rates exists. Note: the model couples attack deceleration to algoHalflife, which is a simplifying assumption with no empirical basis.",
-                sources: [
-                  "Hu et al., 'LoRA,' arXiv:2106.09685 (2021)",
-                  "Dettmers et al., 'QLoRA,' arXiv:2305.14314 (2023)",
-                  "Zhao et al., 'GaLore,' arXiv:2403.03507 (2024)",
-                  "No systematic survey of adversarial fine-tuning efficiency exists [MAJOR GAP]",
                 ],
               },
               {
@@ -1599,16 +1543,6 @@ export default function App() {
                   "Standard computational complexity result for neural network forward/backward pass",
                 ],
               },
-              {
-                eq: "Attack deceleration tied to algo halflife",
-                form: "attack_rate(t) uses algoHalflife for its decay",
-                confidence: "low",
-                justification: "Assumes adversarial fine-tuning improvements decelerate on the same timeline as general algorithmic progress, since they draw from the same research community. This is weakly justified — attack research could decelerate faster (small community) or slower (adversarial competition incentives). A separate attackHalflife parameter would be more honest but adds complexity.",
-                sources: [
-                  "No empirical source — simplifying assumption [STRUCTURAL ASSUMPTION]",
-                  "The shared halflife is a known limitation acknowledged in the model",
-                ],
-              },
             ].map(({ eq, form, confidence, justification, sources }, idx) => {
               const confColor = confidence === "high" ? C.green : confidence === "medium" ? C.yellow : C.red;
               return (
@@ -1642,9 +1576,7 @@ export default function App() {
             <div style={{ background: C.bgCard, border: `1px solid ${C.border}`, borderRadius: 6, padding: 20, lineHeight: 1.8, fontSize: 11, color: C.muted }}>
               {[
                 { priority: "1", gap: "TR scaling with model size", d: "No empirical data above 8B. A study testing TAR or Deep Ignorance at 1B / 7B / 70B / 405B would be the single highest-value contribution to reducing model uncertainty." },
-                { priority: "2", gap: "Attack method improvement rate", d: "No Epoch-quality retrospective analysis exists. A systematic study of fine-tuning efficiency gains (2019-2026) would fill this gap." },
-                { priority: "3", gap: "Attack setup cost decomposition", d: "No published work breaks down the non-compute costs of an adversarial fine-tuning attack. Even a hypothetical/anonymized red-team cost analysis would help." },
-                { priority: "4", gap: "Attack deceleration independence", d: "The model ties attack method improvement to the same halflife as general algorithmic progress. No evidence supports this coupling; a separate attackHalflife would be more honest." },
+                { priority: "2", gap: "Fine-tuning cost validation at scale", d: "Published adversarial fine-tuning experiments rarely report full cost breakdowns. Systematic benchmarks of fine-tuning costs across 7B/70B/405B would ground the compute cost parameter." },
               ].map(({ priority, gap, d }, i) => (
                 <p key={i} style={{ marginTop: i === 0 ? 0 : 6, marginBottom: 6 }}>
                   <span style={{ color: C.red, fontWeight: 600 }}>#{priority} — {gap}: </span>{d}
